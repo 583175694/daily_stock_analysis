@@ -72,12 +72,6 @@ const NAV_ITEMS: DockItem[] = [
         to: '/backtest',
         icon: BacktestIcon,
     },
-    {
-        key: 'settings',
-        label: '设置',
-        to: '/settings',
-        icon: SettingsIcon,
-    },
 ];
 
 // Dock 导航栏
@@ -176,7 +170,6 @@ const AppContent: React.FC = () => {
                     <Route path="/" element={<HomePage/>}/>
                     <Route path="/chat" element={<ChatPage/>}/>
                     <Route path="/backtest" element={<BacktestPage/>}/>
-                    <Route path="/settings" element={<SettingsPage/>}/>
                     <Route path="/login" element={<LoginPage/>}/>
                     <Route path="*" element={<NotFoundPage/>}/>
                 </Routes>
