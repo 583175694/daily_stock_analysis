@@ -171,11 +171,17 @@ def get_history_detail(
             current_price = realtime.get("price")
             change_pct = realtime.get("change_pct") or realtime.get("change_60d")
             
-            # 也尝试从 realtime_quote_raw 获取
+            # Also try realtime_quote_raw (non-agent path)
             if current_price is None:
                 realtime_quote_raw = context_snapshot.get("realtime_quote_raw") or {}
                 current_price = realtime_quote_raw.get("price")
                 change_pct = change_pct or realtime_quote_raw.get("change_pct") or realtime_quote_raw.get("pct_chg")
+
+            # Also try realtime_quote (agent mode stores under this key)
+            if current_price is None:
+                realtime_quote = context_snapshot.get("realtime_quote") or {}
+                current_price = realtime_quote.get("price")
+                change_pct = change_pct or realtime_quote.get("change_pct")
         
         # 构建响应模型
         meta = ReportMeta(

@@ -558,9 +558,12 @@ class StockAnalysisPipeline:
 
             # Fill in price snapshot from realtime quote (mirrors Step 7.5 in non-agent path)
             if result and realtime_quote:
-                rt = self._safe_to_dict(realtime_quote) if not isinstance(realtime_quote, dict) else realtime_quote
-                result.current_price = rt.get('price')
-                result.change_pct = rt.get('change_pct')
+                if isinstance(realtime_quote, dict):
+                    result.current_price = realtime_quote.get('price')
+                    result.change_pct = realtime_quote.get('change_pct')
+                else:
+                    result.current_price = getattr(realtime_quote, 'price', None)
+                    result.change_pct = getattr(realtime_quote, 'change_pct', None)
 
             # 保存分析历史记录
             if result:
