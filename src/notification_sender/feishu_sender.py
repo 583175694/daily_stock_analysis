@@ -5,12 +5,22 @@
 职责：
 1. 通过 webhook 发送飞书消息
 """
+import base64
+import hashlib
+import hmac
 import logging
-from typing import Dict, Any
+import time
+from typing import Any, Dict
+
 import requests
 
 from src.config import Config
-from src.formatters import format_feishu_markdown, truncate_to_bytes
+from src.formatters import (
+    MIN_MAX_BYTES,
+    PAGE_MARKER_SAFE_BYTES,
+    chunk_content_by_max_bytes,
+    format_feishu_markdown,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -26,8 +36,41 @@ class FeishuSender:
             config: 配置对象
         """
         self._feishu_url = getattr(config, 'feishu_webhook_url', None)
+        self._feishu_secret = (getattr(config, 'feishu_webhook_secret', None) or '').strip()
+        self._feishu_keyword = (getattr(config, 'feishu_webhook_keyword', None) or '').strip()
         self._feishu_max_bytes = getattr(config, 'feishu_max_bytes', 20000)
         self._webhook_verify_ssl = getattr(config, 'webhook_verify_ssl', True)
+
+    def _get_keyword_prefix(self) -> str:
+        """Return the keyword prefix required by Feishu webhook security settings."""
+        if not self._feishu_keyword:
+            return ""
+        return f"{self._feishu_keyword}\n"
+
+    def _apply_keyword_prefix(self, content: str) -> str:
+        """Prepend the optional keyword so each webhook request passes keyword checks."""
+        prefix = self._get_keyword_prefix()
+        if not prefix:
+            return content
+        return f"{prefix}{content}" if content else self._feishu_keyword
+
+    def _build_security_fields(self) -> Dict[str, str]:
+        """Build optional signing fields required by Feishu custom robot security."""
+        if not self._feishu_secret:
+            return {}
+
+        timestamp = str(int(time.time()))
+        string_to_sign = f"{timestamp}\n{self._feishu_secret}"
+        sign = base64.b64encode(
+            hmac.new(
+                string_to_sign.encode('utf-8'),
+                digestmod=hashlib.sha256,
+            ).digest()
+        ).decode('utf-8')
+        return {
+            "timestamp": timestamp,
+            "sign": sign,
+        }
     
           
     def send_to_feishu(self, content: str) -> bool:
@@ -61,12 +104,26 @@ class FeishuSender:
         formatted_content = format_feishu_markdown(content)
 
         max_bytes = self._feishu_max_bytes  # 从配置读取，默认 20000 字节
+        keyword_overhead = len(self._get_keyword_prefix().encode('utf-8'))
+        effective_max_bytes = max_bytes - keyword_overhead
+
+        if effective_max_bytes <= 0:
+            logger.error("飞书关键词过长，超过单条消息允许的最大字节数，无法发送")
+            return False
         
         # 检查字节长度，超长则分批发送
-        content_bytes = len(formatted_content.encode('utf-8'))
+        content_bytes = len(formatted_content.encode('utf-8')) + keyword_overhead
         if content_bytes > max_bytes:
+            min_chunk_bytes = MIN_MAX_BYTES + PAGE_MARKER_SAFE_BYTES
+            if effective_max_bytes < min_chunk_bytes:
+                logger.error(
+                    "飞书关键词过长，剩余分片预算(%s字节)不足以安全分页发送，至少需要 %s 字节",
+                    effective_max_bytes,
+                    min_chunk_bytes,
+                )
+                return False
             logger.info(f"飞书消息内容超长({content_bytes}字节/{len(content)}字符)，将分批发送")
-            return self._send_feishu_chunked(formatted_content, max_bytes)
+            return self._send_feishu_chunked(formatted_content, effective_max_bytes)
         
         try:
             return self._send_feishu_message(formatted_content)
@@ -87,62 +144,11 @@ class FeishuSender:
         Returns:
             是否全部发送成功
         """
-        import time
-        
-        def get_bytes(s: str) -> int:
-            """获取字符串的 UTF-8 字节数"""
-            return len(s.encode('utf-8'))
-        
-        # 智能分割：优先按 "---" 分隔（股票之间的分隔线）
-        # 如果没有分隔线，按 "### " 标题分割（每只股票的标题）
-        if "\n---\n" in content:
-            sections = content.split("\n---\n")
-            separator = "\n---\n"
-        elif "\n### " in content:
-            # 按 ### 分割，但保留 ### 前缀
-            parts = content.split("\n### ")
-            sections = [parts[0]] + [f"### {p}" for p in parts[1:]]
-            separator = "\n"
-        else:
-            # 无法智能分割，按行强制分割
-            return self._send_feishu_force_chunked(content, max_bytes)
-        
-        chunks = []
-        current_chunk = []
-        current_bytes = 0
-        separator_bytes = get_bytes(separator)
-        
-        for section in sections:
-            section_bytes = get_bytes(section) + separator_bytes
-            
-            # 如果单个 section 就超长，需要强制截断
-            if section_bytes > max_bytes:
-                # 先发送当前积累的内容
-                if current_chunk:
-                    chunks.append(separator.join(current_chunk))
-                    current_chunk = []
-                    current_bytes = 0
-                
-                # 强制截断这个超长 section（按字节截断）
-                truncated = truncate_to_bytes(section, max_bytes - 200)
-                truncated += "\n\n...(本段内容过长已截断)"
-                chunks.append(truncated)
-                continue
-            
-            # 检查加入后是否超长
-            if current_bytes + section_bytes > max_bytes:
-                # 保存当前块，开始新块
-                if current_chunk:
-                    chunks.append(separator.join(current_chunk))
-                current_chunk = [section]
-                current_bytes = section_bytes
-            else:
-                current_chunk.append(section)
-                current_bytes += section_bytes
-        
-        # 添加最后一块
-        if current_chunk:
-            chunks.append(separator.join(current_chunk))
+        try:
+            chunks = chunk_content_by_max_bytes(content, max_bytes, add_page_marker=True)
+        except ValueError as e:
+            logger.error("飞书消息分片失败，单片预算不足以安全分页（关键词过长或 max_bytes 过小）: %s", e)
+            return False
         
         # 分批发送
         total_chunks = len(chunks)
@@ -151,15 +157,8 @@ class FeishuSender:
         logger.info(f"飞书分批发送：共 {total_chunks} 批")
         
         for i, chunk in enumerate(chunks):
-            # 添加分页标记
-            if total_chunks > 1:
-                page_marker = f"\n\n📄 ({i+1}/{total_chunks})"
-                chunk_with_marker = chunk + page_marker
-            else:
-                chunk_with_marker = chunk
-            
             try:
-                if self._send_feishu_message(chunk_with_marker):
+                if self._send_feishu_message(chunk):
                     success_count += 1
                     logger.info(f"飞书第 {i+1}/{total_chunks} 批发送成功")
                 else:
@@ -173,62 +172,20 @@ class FeishuSender:
         
         return success_count == total_chunks
     
-    def _send_feishu_force_chunked(self, content: str, max_bytes: int) -> bool:
-        """
-        强制按字节分割发送（无法智能分割时的 fallback）
-        
-        Args:
-            content: 完整消息内容
-            max_bytes: 单条消息最大字节数
-        """
-        import time
-        
-        chunks = []
-        current_chunk = ""
-        
-        # 按行分割，确保不会在多字节字符中间截断
-        lines = content.split('\n')
-        
-        for line in lines:
-            test_chunk = current_chunk + ('\n' if current_chunk else '') + line
-            if len(test_chunk.encode('utf-8')) > max_bytes - 100:  # 预留空间给分页标记
-                if current_chunk:
-                    chunks.append(current_chunk)
-                current_chunk = line
-            else:
-                current_chunk = test_chunk
-        
-        if current_chunk:
-            chunks.append(current_chunk)
-        
-        total_chunks = len(chunks)
-        success_count = 0
-        
-        logger.info(f"飞书强制分批发送：共 {total_chunks} 批")
-        
-        for i, chunk in enumerate(chunks):
-            page_marker = f"\n\n📄 ({i+1}/{total_chunks})" if total_chunks > 1 else ""
-            
-            try:
-                if self._send_feishu_message(chunk + page_marker):
-                    success_count += 1
-            except Exception as e:
-                logger.error(f"飞书第 {i+1}/{total_chunks} 批发送异常: {e}")
-            
-            if i < total_chunks - 1:
-                time.sleep(1)
-        
-        return success_count == total_chunks
-    
     def _send_feishu_message(self, content: str) -> bool:
         """发送单条飞书消息（优先使用 Markdown 卡片）"""
+        prepared_content = self._apply_keyword_prefix(content)
+        security_fields = self._build_security_fields()
+
         def _post_payload(payload: Dict[str, Any]) -> bool:
+            request_payload = dict(payload)
+            request_payload.update(security_fields)
             logger.debug(f"飞书请求 URL: {self._feishu_url}")
-            logger.debug(f"飞书请求 payload 长度: {len(content)} 字符")
+            logger.debug(f"飞书请求 payload 长度: {len(prepared_content)} 字符")
 
             response = requests.post(
                 self._feishu_url,
-                json=payload,
+                json=request_payload,
                 timeout=30,
                 verify=self._webhook_verify_ssl
             )
@@ -269,7 +226,7 @@ class FeishuSender:
                         "tag": "div",
                         "text": {
                             "tag": "lark_md",
-                            "content": content
+                            "content": prepared_content
                         }
                     }
                 ]
@@ -283,7 +240,7 @@ class FeishuSender:
         text_payload = {
             "msg_type": "text",
             "content": {
-                "text": content
+                "text": prepared_content
             }
         }
 
