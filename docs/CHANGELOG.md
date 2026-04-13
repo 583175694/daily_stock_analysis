@@ -21,6 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] `StockAnalysisPipeline` 搜索服务与社交舆情服务改为可选降级初始化：任一服务初始化异常时记录 warning 并以禁用状态继续运行，避免外部依赖抖动阻塞主分析链路与 SSE 进度回调。
 - [文档] DEPLOY.md 和 deploy-webui-cloud.md 新增"UI 元素异常变大/布局错乱"排查步骤（重建 Docker 镜像或手动执行 npm run build）
 - [文档] 补充飞书 Webhook 配置说明：强调 `FEISHU_WEBHOOK_URL` 是群通知必填项、`FEISHU_WEBHOOK_SECRET` 与飞书机器人「签名校验」必须两端同时启用或同时关闭、`FEISHU_APP_SECRET` 仅用于应用/Stream Bot 模式不可替代 Webhook；同步完善英文指南并在 `.env.example` 为相关配置项补充内联说明注释
+- [文档] 新增 AI 选股扩展方案设计文档，梳理同仓独立业务域、低冲突集成、配置与数据边界以及分阶段实施建议。
+- [文档] 新增 AI 选股 PRD，补充目标用户、核心场景、功能范围、版本规划、验收标准与非功能要求。
+- [文档] 新增 AI 选股实施方案，细化目录结构、API 草案、数据表草案、页面结构、薄集成改动点与开发顺序。
+- [文档] 新增 AI 选股开发前确认清单，收口 V1 模板、股票池、评分维度、接口、数据表、页面交互与开工门槛。
+- [文档] 细化 AI 选股策略输入模式，补充内置模板、参数化模板、自然语言策略输入的分阶段方案，并明确 V1 仅支持内置模板。
+- [新功能] 新增 AI 选股 V1：后端增加 `/api/v1/picker/*` 异步任务接口与落库结果，Web 新增 `/picker` 页面，支持基于 `STOCK_LIST` 使用内置模板（趋势突破 / 强势回踩 / 均衡筛选）输出 Top 20 候选并由 AI 解读前 10 名。
+- [修复] 补齐 AI 选股 V1 页面交互：`/picker` 新增显式股票池选择器，并在候选列表与详情抽屉中接通“一键分析该股 / 去问股”动作，和 V1 PRD 范围保持一致。
+- [修复] 修复 AI 选股读取缓存日线数据时的 SQLAlchemy `DetachedInstanceError`：选股缓存读取改为返回脱离 Session 也可安全访问的纯数据快照，避免任务在扫描阶段被中途打断。
+- [修复] 优化 AI 选股解释链路：Analyzer 复用 MiniMax 自定义定价注册以减少 LiteLLM 成本映射噪音，同时压缩候选解释 prompt 中的板块与新闻摘要，降低解释阶段耗时与日志噪音。
+- [修复] AI 选股日线缓存复用改为按市场“最新可复用交易日”判断，不再把数个自然日前的旧缓存误当作最新行情展示。
 
 - [新功能] 集成 Longbridge OpenAPI 作为美股/港股可选数据源；配置 `LONGBRIDGE_*` 后优先使用长桥获取日线与实时行情，YFinance / AkShare 兜底；未配置时行为与此前一致。长桥联调请使用 `tests/longbridge_live_smoke.py`（手动脚本，不参与 pytest 收集）。
 - [文档] 澄清 README（中/英/繁）中长桥「首选 / 兜底 / 未配置不调用」的边界；`docs/README_EN.md` / `docs/README_CHT.md` 顶部导航与完整指南链接改为 `./` 相对路径，避免在文档子目录下解析错误；`LONGBRIDGE_PRINT_QUOTE_PACKAGES` 与代码及 `.env.example` 对齐为未设置时默认关闭。

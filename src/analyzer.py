@@ -21,7 +21,7 @@ import litellm
 from json_repair import repair_json
 from litellm import Router
 
-from src.agent.llm_adapter import get_thinking_extra_body
+from src.agent.llm_adapter import LLMToolAdapter, get_thinking_extra_body
 from src.agent.skills.defaults import CORE_TRADING_SKILL_POLICY_ZH
 from src.config import (
     Config,
@@ -940,6 +940,9 @@ class GeminiAnalyzer:
             logger.warning("Analyzer LLM: LITELLM_MODEL not configured")
             return
 
+        # Keep Analyzer and Agent on the same LiteLLM model-pricing registry so
+        # MiniMax-family models do not spam cost-map lookup errors on each call.
+        LLMToolAdapter._register_custom_model_pricing()
         self._litellm_available = True
 
         # --- Channel / YAML path: build Router from pre-built model_list ---

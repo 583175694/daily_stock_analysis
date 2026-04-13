@@ -31,6 +31,7 @@ from api.v1 import api_v1_router
 from api.middlewares.auth import add_auth_middleware
 from api.middlewares.error_handler import add_error_handlers
 from api.v1.schemas.common import HealthResponse
+from src.stock_picker.service import StockPickerService
 from src.services.system_config_service import SystemConfigService
 
 
@@ -38,9 +39,15 @@ from src.services.system_config_service import SystemConfigService
 async def app_lifespan(app: FastAPI):
     """Initialize and release shared services for the app lifecycle."""
     app.state.system_config_service = SystemConfigService()
+    app.state.stock_picker_service = StockPickerService()
     try:
         yield
     finally:
+        if hasattr(app.state, "stock_picker_service"):
+            try:
+                app.state.stock_picker_service.shutdown()
+            finally:
+                delattr(app.state, "stock_picker_service")
         if hasattr(app.state, "system_config_service"):
             delattr(app.state, "system_config_service")
 

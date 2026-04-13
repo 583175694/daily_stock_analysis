@@ -91,6 +91,21 @@ from api.v1.schemas.portfolio import (
     PortfolioFxRefreshResponse,
     PortfolioRiskResponse,
 )
+from api.v1.schemas.picker import (
+    PickerTemplateItem,
+    PickerTemplatesResponse,
+    PickerUniverseItem,
+    PickerUniversesResponse,
+    PickerRunRequest,
+    PickerRunResponse,
+    PickerTaskSummary,
+    PickerTaskItem,
+    PickerTaskListResponse,
+    PickerScoreItem,
+    PickerNewsBrief,
+    PickerCandidateItem,
+    PickerTaskDetailResponse,
+)
 
 __all__ = [
     # common
@@ -169,4 +184,18 @@ __all__ = [
     "PortfolioImportBrokerListResponse",
     "PortfolioFxRefreshResponse",
     "PortfolioRiskResponse",
+    # picker
+    "PickerTemplateItem",
+    "PickerTemplatesResponse",
+    "PickerUniverseItem",
+    "PickerUniversesResponse",
+    "PickerRunRequest",
+    "PickerRunResponse",
+    "PickerTaskSummary",
+    "PickerTaskItem",
+    "PickerTaskListResponse",
+    "PickerScoreItem",
+    "PickerNewsBrief",
+    "PickerCandidateItem",
+    "PickerTaskDetailResponse",
 ]

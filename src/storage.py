@@ -396,6 +396,90 @@ class BacktestSummary(Base):
     )
 
 
+class PickerTask(Base):
+    """AI 选股异步任务。"""
+
+    __tablename__ = 'picker_tasks'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String(64), nullable=False, unique=True, index=True)
+    status = Column(String(16), nullable=False, default='queued', index=True)
+    template_id = Column(String(32), nullable=False, index=True)
+    template_version = Column(String(16), nullable=False, default='v1')
+    universe_id = Column(String(32), nullable=False, index=True)
+    result_limit = Column(Integer, nullable=False, default=20)
+    ai_top_k = Column(Integer, nullable=False, default=10)
+    force_refresh = Column(Boolean, nullable=False, default=False)
+    total_stocks = Column(Integer, nullable=False, default=0)
+    processed_stocks = Column(Integer, nullable=False, default=0)
+    candidate_count = Column(Integer, nullable=False, default=0)
+    progress_percent = Column(Integer, nullable=False, default=0)
+    progress_message = Column(String(255))
+    summary_json = Column(Text)
+    error_message = Column(Text)
+    request_payload_json = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    started_at = Column(DateTime)
+    finished_at = Column(DateTime)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_picker_task_created_status', 'created_at', 'status'),
+        Index('ix_picker_task_template_universe', 'template_id', 'universe_id'),
+    )
+
+
+class PickerCandidate(Base):
+    """AI 选股候选结果。"""
+
+    __tablename__ = 'picker_candidates'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    picker_task_id = Column(Integer, ForeignKey('picker_tasks.id'), nullable=False, index=True)
+    rank = Column(Integer, nullable=False, default=0, index=True)
+    code = Column(String(16), nullable=False, index=True)
+    name = Column(String(64))
+    market = Column(String(8), nullable=False, default='cn')
+    selection_reason = Column(String(24), nullable=False, default='strict_match')
+    latest_date = Column(Date)
+    latest_close = Column(Float)
+    change_pct = Column(Float)
+    volume_ratio = Column(Float)
+    distance_to_high_pct = Column(Float)
+    total_score = Column(Float, nullable=False, default=0.0)
+    board_names_json = Column(Text)
+    news_briefs_json = Column(Text)
+    explanation_summary = Column(Text)
+    explanation_rationale_json = Column(Text)
+    explanation_risks_json = Column(Text)
+    explanation_watchpoints_json = Column(Text)
+    technical_snapshot_json = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('picker_task_id', 'code', name='uix_picker_candidate_task_code'),
+        Index('ix_picker_candidate_task_rank', 'picker_task_id', 'rank'),
+    )
+
+
+class PickerCandidateScore(Base):
+    """AI 选股候选拆分得分。"""
+
+    __tablename__ = 'picker_candidate_scores'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    picker_candidate_id = Column(Integer, ForeignKey('picker_candidates.id'), nullable=False, index=True)
+    score_name = Column(String(32), nullable=False)
+    score_label = Column(String(64))
+    score_value = Column(Float, nullable=False, default=0.0)
+    detail_json = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('picker_candidate_id', 'score_name', name='uix_picker_candidate_score_name'),
+    )
+
+
 class PortfolioAccount(Base):
     """Portfolio account metadata."""
 

@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from src.storage import DatabaseManager
 from src.config import get_config, Config
+from src.stock_picker.service import StockPickerService
 from src.services.system_config_service import SystemConfigService
 
 
@@ -68,4 +69,13 @@ def get_system_config_service(request: Request) -> SystemConfigService:
     if service is None:
         service = SystemConfigService()
         request.app.state.system_config_service = service
+    return service
+
+
+def get_stock_picker_service(request: Request) -> StockPickerService:
+    """Get app-lifecycle shared StockPickerService instance."""
+    service = getattr(request.app.state, "stock_picker_service", None)
+    if service is None:
+        service = StockPickerService()
+        request.app.state.stock_picker_service = service
     return service
