@@ -16,10 +16,18 @@ export interface PickerUniverseItem {
   codes: string[];
 }
 
+export interface PickerSectorItem {
+  sectorId: string;
+  name: string;
+  market: string;
+  stockCount: number;
+}
+
 export interface PickerTaskSummary {
   templateId?: string | null;
   templateName?: string | null;
   universeId?: string | null;
+  mode?: string | null;
   totalStocks: number;
   scoredCount: number;
   insufficientCount: number;
@@ -45,6 +53,22 @@ export interface PickerNewsBrief {
   snippet?: string | null;
 }
 
+export interface PickerCandidateEvaluationItem {
+  windowDays: number;
+  benchmarkCode?: string | null;
+  evalStatus: string;
+  entryDate?: string | null;
+  entryPrice?: number | null;
+  exitDate?: string | null;
+  exitPrice?: number | null;
+  benchmarkEntryPrice?: number | null;
+  benchmarkExitPrice?: number | null;
+  returnPct?: number | null;
+  benchmarkReturnPct?: number | null;
+  excessReturnPct?: number | null;
+  maxDrawdownPct?: number | null;
+}
+
 export interface PickerCandidateItem {
   rank: number;
   code: string;
@@ -65,6 +89,7 @@ export interface PickerCandidateItem {
   explanationWatchpoints: string[];
   technicalSnapshot: Record<string, unknown>;
   scoreBreakdown: PickerScoreItem[];
+  evaluations: PickerCandidateEvaluationItem[];
 }
 
 export interface PickerTaskItem {
@@ -76,9 +101,14 @@ export interface PickerTaskItem {
   templateVersion: string;
   universeId: string;
   universeName?: string | null;
+  mode: 'watchlist' | 'sector' | string;
+  modeLabel?: string | null;
+  sectorIds: string[];
+  sectorNames: string[];
   limit: number;
   aiTopK: number;
   forceRefresh: boolean;
+  notify: boolean;
   totalStocks: number;
   processedStocks: number;
   candidateCount: number;
@@ -101,11 +131,32 @@ export interface PickerRunRequest {
   templateId: string;
   templateOverrides?: Record<string, unknown>;
   universeId: string;
+  mode?: 'watchlist' | 'sector';
+  sectorIds?: string[];
   limit?: number;
+  aiTopK?: number;
   forceRefresh?: boolean;
+  notify?: boolean;
 }
 
 export interface PickerRunResponse {
   taskId: string;
   status: string;
+}
+
+export interface PickerTemplateStatItem {
+  templateId: string;
+  templateName: string;
+  windowDays: number;
+  totalEvaluations: number;
+  winRatePct?: number | null;
+  avgReturnPct?: number | null;
+  avgExcessReturnPct?: number | null;
+  avgMaxDrawdownPct?: number | null;
+}
+
+export interface PickerTemplateStatsResponse {
+  windowDays: number;
+  benchmarkCode: string;
+  items: PickerTemplateStatItem[];
 }

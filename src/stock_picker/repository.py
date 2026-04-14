@@ -9,6 +9,7 @@ from sqlalchemy import delete, desc, select
 from src.storage import (
     DatabaseManager,
     PickerCandidate,
+    PickerCandidateEvaluation,
     PickerCandidateScore,
     PickerTask,
     StockDaily,
@@ -131,6 +132,13 @@ class StockPickerRepository:
             ).scalar_one()
 
             session.execute(
+                delete(PickerCandidateEvaluation).where(
+                    PickerCandidateEvaluation.picker_candidate_id.in_(
+                        select(PickerCandidate.id).where(PickerCandidate.picker_task_id == task.id)
+                    )
+                )
+            )
+            session.execute(
                 delete(PickerCandidateScore).where(
                     PickerCandidateScore.picker_candidate_id.in_(
                         select(PickerCandidate.id).where(PickerCandidate.picker_task_id == task.id)
@@ -206,6 +214,14 @@ class StockPickerRepository:
             ).scalars().all()
             return [self._serialize_task(row) for row in rows]
 
+    def list_task_ids(self, *, status: Optional[str] = None) -> List[str]:
+        with self.db.session_scope() as session:
+            query = select(PickerTask.task_id).order_by(desc(PickerTask.created_at), desc(PickerTask.id))
+            if status:
+                query = query.where(PickerTask.status == status)
+            rows = session.execute(query).scalars().all()
+            return [str(row) for row in rows]
+
     def get_task(self, task_id: str, *, include_candidates: bool = True) -> Optional[Dict[str, Any]]:
         with self.db.session_scope() as session:
             task = session.execute(
@@ -240,11 +256,174 @@ class StockPickerRepository:
             for score_row in score_rows:
                 score_map.setdefault(score_row.picker_candidate_id, []).append(score_row)
 
+            evaluation_rows = session.execute(
+                select(PickerCandidateEvaluation)
+                .where(PickerCandidateEvaluation.picker_candidate_id.in_(candidate_ids))
+                .order_by(
+                    PickerCandidateEvaluation.picker_candidate_id.asc(),
+                    PickerCandidateEvaluation.window_days.asc(),
+                )
+            ).scalars().all()
+            evaluation_map: Dict[int, List[PickerCandidateEvaluation]] = {}
+            for evaluation_row in evaluation_rows:
+                evaluation_map.setdefault(evaluation_row.picker_candidate_id, []).append(evaluation_row)
+
             payload["candidates"] = [
-                self._serialize_candidate(row, score_map.get(row.id, []))
+                self._serialize_candidate(
+                    row,
+                    score_map.get(row.id, []),
+                    evaluation_map.get(row.id, []),
+                )
                 for row in candidate_rows
             ]
             return payload
+
+    def get_task_candidate_rows(self, task_id: str) -> List[Dict[str, Any]]:
+        with self.db.session_scope() as session:
+            task = session.execute(
+                select(PickerTask).where(PickerTask.task_id == task_id)
+            ).scalar_one_or_none()
+            if task is None:
+                return []
+
+            candidate_rows = session.execute(
+                select(PickerCandidate)
+                .where(PickerCandidate.picker_task_id == task.id)
+                .order_by(PickerCandidate.rank.asc(), PickerCandidate.total_score.desc())
+            ).scalars().all()
+            return [
+                {
+                    "candidate_id": row.id,
+                    "code": row.code,
+                    "market": row.market,
+                    "latest_date": row.latest_date,
+                }
+                for row in candidate_rows
+            ]
+
+    def upsert_candidate_evaluation(
+        self,
+        *,
+        picker_candidate_id: int,
+        window_days: int,
+        benchmark_code: str,
+        eval_status: str,
+        entry_date: Optional[date],
+        entry_price: Optional[float],
+        exit_date: Optional[date],
+        exit_price: Optional[float],
+        benchmark_entry_price: Optional[float],
+        benchmark_exit_price: Optional[float],
+        return_pct: Optional[float],
+        benchmark_return_pct: Optional[float],
+        excess_return_pct: Optional[float],
+        max_drawdown_pct: Optional[float],
+    ) -> None:
+        with self.db.session_scope() as session:
+            row = session.execute(
+                select(PickerCandidateEvaluation).where(
+                    PickerCandidateEvaluation.picker_candidate_id == picker_candidate_id,
+                    PickerCandidateEvaluation.window_days == window_days,
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                row = PickerCandidateEvaluation(
+                    picker_candidate_id=picker_candidate_id,
+                    window_days=window_days,
+                )
+                session.add(row)
+
+            row.benchmark_code = benchmark_code
+            row.eval_status = eval_status
+            row.entry_date = entry_date
+            row.entry_price = entry_price
+            row.exit_date = exit_date
+            row.exit_price = exit_price
+            row.benchmark_entry_price = benchmark_entry_price
+            row.benchmark_exit_price = benchmark_exit_price
+            row.return_pct = return_pct
+            row.benchmark_return_pct = benchmark_return_pct
+            row.excess_return_pct = excess_return_pct
+            row.max_drawdown_pct = max_drawdown_pct
+            row.updated_at = datetime.now()
+
+    def list_task_evaluations(
+        self,
+        task_id: str,
+        *,
+        window_days: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        with self.db.session_scope() as session:
+            task = session.execute(
+                select(PickerTask).where(PickerTask.task_id == task_id)
+            ).scalar_one_or_none()
+            if task is None:
+                return []
+
+            query = (
+                select(PickerCandidateEvaluation, PickerCandidate.code)
+                .join(PickerCandidate, PickerCandidate.id == PickerCandidateEvaluation.picker_candidate_id)
+                .where(PickerCandidate.picker_task_id == task.id)
+            )
+            if window_days is not None:
+                query = query.where(PickerCandidateEvaluation.window_days == window_days)
+
+            rows = session.execute(
+                query.order_by(
+                    PickerCandidateEvaluation.window_days.asc(),
+                    PickerCandidate.rank.asc(),
+                )
+            ).all()
+            return [
+                {
+                    "candidate_id": evaluation.picker_candidate_id,
+                    "code": code,
+                    "window_days": evaluation.window_days,
+                    "benchmark_code": evaluation.benchmark_code,
+                    "eval_status": evaluation.eval_status,
+                    "entry_date": _iso_date(evaluation.entry_date),
+                    "entry_price": evaluation.entry_price,
+                    "exit_date": _iso_date(evaluation.exit_date),
+                    "exit_price": evaluation.exit_price,
+                    "benchmark_entry_price": evaluation.benchmark_entry_price,
+                    "benchmark_exit_price": evaluation.benchmark_exit_price,
+                    "return_pct": evaluation.return_pct,
+                    "benchmark_return_pct": evaluation.benchmark_return_pct,
+                    "excess_return_pct": evaluation.excess_return_pct,
+                    "max_drawdown_pct": evaluation.max_drawdown_pct,
+                }
+                for evaluation, code in rows
+            ]
+
+    def list_evaluation_rows_for_window(self, window_days: int) -> List[Dict[str, Any]]:
+        with self.db.session_scope() as session:
+            rows = session.execute(
+                select(
+                    PickerCandidateEvaluation,
+                    PickerCandidate.code,
+                    PickerCandidate.market,
+                    PickerTask.template_id,
+                )
+                .join(PickerCandidate, PickerCandidate.id == PickerCandidateEvaluation.picker_candidate_id)
+                .join(PickerTask, PickerTask.id == PickerCandidate.picker_task_id)
+                .where(PickerCandidateEvaluation.window_days == window_days)
+                .order_by(PickerCandidateEvaluation.updated_at.desc())
+            ).all()
+            return [
+                {
+                    "candidate_id": evaluation.picker_candidate_id,
+                    "code": code,
+                    "market": market,
+                    "template_id": template_id,
+                    "window_days": evaluation.window_days,
+                    "eval_status": evaluation.eval_status,
+                    "return_pct": evaluation.return_pct,
+                    "benchmark_return_pct": evaluation.benchmark_return_pct,
+                    "excess_return_pct": evaluation.excess_return_pct,
+                    "max_drawdown_pct": evaluation.max_drawdown_pct,
+                }
+                for evaluation, code, market, template_id in rows
+            ]
 
     def get_recent_daily_rows(self, code: str, *, limit: int = 90) -> List[Dict[str, Any]]:
         with self.db.session_scope() as session:
@@ -298,6 +477,7 @@ class StockPickerRepository:
     def _serialize_candidate(
         row: PickerCandidate,
         score_rows: List[PickerCandidateScore],
+        evaluation_rows: List[PickerCandidateEvaluation],
     ) -> Dict[str, Any]:
         return {
             "rank": row.rank,
@@ -326,5 +506,23 @@ class StockPickerRepository:
                     "detail": _json_loads(score_row.detail_json, {}),
                 }
                 for score_row in score_rows
+            ],
+            "evaluations": [
+                {
+                    "window_days": evaluation_row.window_days,
+                    "benchmark_code": evaluation_row.benchmark_code,
+                    "eval_status": evaluation_row.eval_status,
+                    "entry_date": _iso_date(evaluation_row.entry_date),
+                    "entry_price": evaluation_row.entry_price,
+                    "exit_date": _iso_date(evaluation_row.exit_date),
+                    "exit_price": evaluation_row.exit_price,
+                    "benchmark_entry_price": evaluation_row.benchmark_entry_price,
+                    "benchmark_exit_price": evaluation_row.benchmark_exit_price,
+                    "return_pct": evaluation_row.return_pct,
+                    "benchmark_return_pct": evaluation_row.benchmark_return_pct,
+                    "excess_return_pct": evaluation_row.excess_return_pct,
+                    "max_drawdown_pct": evaluation_row.max_drawdown_pct,
+                }
+                for evaluation_row in evaluation_rows
             ],
         }

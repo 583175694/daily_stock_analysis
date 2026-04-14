@@ -26,5 +26,8 @@ def ensure_litellm_stub() -> None:
         pass
 
     litellm_stub.Router = _DummyRouter
+    litellm_stub.register_model = lambda *_args, **_kwargs: None
     litellm_stub.completion = lambda **kwargs: None
+    litellm_stub.set_verbose = False
+    litellm_stub.suppress_debug_info = True
     sys.modules["litellm"] = litellm_stub

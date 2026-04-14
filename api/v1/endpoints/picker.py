@@ -12,8 +12,12 @@ from api.v1.schemas.common import ErrorResponse
 from api.v1.schemas.picker import (
     PickerRunRequest,
     PickerRunResponse,
+    PickerSectorsResponse,
+    PickerSectorItem,
     PickerTaskDetailResponse,
     PickerTaskItem,
+    PickerTemplateStatItem,
+    PickerTemplateStatsResponse,
     PickerTaskListResponse,
     PickerTemplatesResponse,
     PickerTemplateItem,
@@ -53,6 +57,19 @@ def get_picker_universes(
     return PickerUniversesResponse(items=items)
 
 
+@router.get(
+    "/sectors",
+    response_model=PickerSectorsResponse,
+    responses={200: {"description": "板块列表"}},
+    summary="获取可用行业板块列表",
+)
+def get_picker_sectors(
+    service: StockPickerService = Depends(get_stock_picker_service),
+) -> PickerSectorsResponse:
+    items = [PickerSectorItem(**item) for item in service.list_sectors()]
+    return PickerSectorsResponse(items=items)
+
+
 @router.post(
     "/run",
     response_model=PickerRunResponse,
@@ -72,8 +89,12 @@ def run_picker(
             template_id=request.template_id,
             template_overrides=request.template_overrides,
             universe_id=request.universe_id,
+            mode=request.mode,
+            sector_ids=request.sector_ids,
             limit=request.limit,
+            ai_top_k=request.ai_top_k,
             force_refresh=request.force_refresh,
+            notify=request.notify,
         )
         return PickerRunResponse(**payload)
     except ValueError as exc:
@@ -123,3 +144,31 @@ def get_picker_task(
             detail={"error": "not_found", "message": f"选股任务 {task_id} 不存在"},
         )
     return PickerTaskDetailResponse(**payload)
+
+
+@router.get(
+    "/stats/templates",
+    response_model=PickerTemplateStatsResponse,
+    responses={
+        200: {"description": "模板效果统计"},
+        400: {"description": "参数错误", "model": ErrorResponse},
+    },
+    summary="获取 AI 选股模板效果统计",
+)
+def get_picker_template_stats(
+    window_days: int = Query(10, ge=1, le=20, description="统计窗口，仅支持 5/10/20"),
+    service: StockPickerService = Depends(get_stock_picker_service),
+) -> PickerTemplateStatsResponse:
+    try:
+        payload = service.list_template_stats(window_days=window_days)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_params", "message": str(exc)},
+        )
+    items = [PickerTemplateStatItem(**item) for item in payload["items"]]
+    return PickerTemplateStatsResponse(
+        window_days=payload["window_days"],
+        benchmark_code=payload["benchmark_code"],
+        items=items,
+    )

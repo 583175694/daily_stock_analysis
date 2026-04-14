@@ -61,30 +61,46 @@ _OPT_IN_THINKING_MODELS: Dict[str, dict] = {
     "deepseek-chat": {"thinking": {"type": "enabled"}},
 }
 
-# Custom model pricing for models not in LiteLLM's built-in price list
+def _pricing_aliases(pricing: Dict[str, Any], *model_names: str) -> Dict[str, dict]:
+    """Expand one pricing payload across all exact LiteLLM model-name aliases."""
+    return {model_name: dict(pricing) for model_name in model_names}
+
+
+# Custom model pricing for models not in LiteLLM's built-in price list.
+# LiteLLM cost lookup is exact-string based, so register both provider-prefixed
+# and case-variant aliases for OpenAI-compatible MiniMax deployments.
 # Official MiniMax pricing: https://platform.minimax.io/docs/guides/pricing-paygo
 # - MiniMax-M2.7 / M2.5: $0.3/M input tokens, $1.2/M output tokens
+_MINIMAX_M2_SERIES_PRICING: Dict[str, Any] = {
+    "supports_function_calling": True,
+    "supports_vision": False,
+    "supports_audio_input": False,
+    "supports_audio_output": False,
+    "context_window": 100000,
+    "max_tokens": 10000,
+    "input_cost_per_token": 0.0000003,   # $0.3 / 1M tokens
+    "output_cost_per_token": 0.0000012,   # $1.2 / 1M tokens
+}
+
 _CUSTOM_MODEL_PRICING: Dict[str, dict] = {
-    "MiniMax-M2.7": {
-        "supports_function_calling": True,
-        "supports_vision": False,
-        "supports_audio_input": False,
-        "supports_audio_output": False,
-        "context_window": 100000,
-        "max_tokens": 10000,
-        "input_cost_per_token": 0.0000003,   # $0.3 / 1M tokens
-        "output_cost_per_token": 0.0000012,   # $1.2 / 1M tokens
-    },
-    "MiniMax-M2.5": {
-        "supports_function_calling": True,
-        "supports_vision": False,
-        "supports_audio_input": False,
-        "supports_audio_output": False,
-        "context_window": 100000,
-        "max_tokens": 10000,
-        "input_cost_per_token": 0.0000003,   # $0.3 / 1M tokens
-        "output_cost_per_token": 0.0000012,   # $1.2 / 1M tokens
-    },
+    **_pricing_aliases(
+        _MINIMAX_M2_SERIES_PRICING,
+        "MiniMax-M2.7",
+        "openai/MiniMax-M2.7",
+        "minimax/MiniMax-M2.7",
+    ),
+    **_pricing_aliases(
+        _MINIMAX_M2_SERIES_PRICING,
+        "MiniMax-M2.5",
+        "openai/MiniMax-M2.5",
+        "minimax/MiniMax-M2.5",
+        "MiniMax-M2.5-highspeed",
+        "MiniMax-M2.5-HighSpeed",
+        "openai/MiniMax-M2.5-highspeed",
+        "openai/MiniMax-M2.5-HighSpeed",
+        "minimax/MiniMax-M2.5-highspeed",
+        "minimax/MiniMax-M2.5-HighSpeed",
+    ),
 }
 
 

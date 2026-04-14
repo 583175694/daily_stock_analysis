@@ -5,13 +5,16 @@ import { useNavigate } from 'react-router-dom';
 import { analysisApi, DuplicateTaskError } from '../api/analysis';
 import { stockPickerApi } from '../api/stockPicker';
 import { systemConfigApi } from '../api/systemConfig';
-import { getParsedApiError, type ParsedApiError } from '../api/error';
+import { createParsedApiError, getParsedApiError, type ParsedApiError } from '../api/error';
 import { ApiErrorAlert, Badge, Card, Drawer, EmptyState, PageHeader, SectionCard, Select } from '../components/common';
 import type {
+  PickerCandidateEvaluationItem,
   PickerCandidateItem,
+  PickerSectorItem,
   PickerTaskDetail,
   PickerTaskItem,
   PickerTemplateItem,
+  PickerTemplateStatItem,
   PickerUniverseItem,
 } from '../types/stockPicker';
 
@@ -65,6 +68,40 @@ function selectionReasonLabel(value: string): string {
   return value === 'strict_match' ? '严格命中' : '补位候选';
 }
 
+function pickerModeLabel(mode: string): string {
+  return mode === 'sector' ? '板块模式' : '自选股模式';
+}
+
+function evaluationStatusLabel(status: string): string {
+  switch (status) {
+    case 'completed':
+      return '已完成';
+    case 'pending':
+      return '待更新';
+    case 'invalid':
+      return '数据无效';
+    default:
+      return status || '--';
+  }
+}
+
+function evaluationStatusBadge(status: string) {
+  switch (status) {
+    case 'completed':
+      return <Badge variant="success">已完成</Badge>;
+    case 'pending':
+      return <Badge variant="warning">待更新</Badge>;
+    case 'invalid':
+      return <Badge variant="danger">数据无效</Badge>;
+    default:
+      return <Badge variant="default">{evaluationStatusLabel(status)}</Badge>;
+  }
+}
+
+function hasComparableBenchmark(evaluation: PickerCandidateEvaluationItem): boolean {
+  return evaluation.excessReturnPct != null && !Number.isNaN(Number(evaluation.excessReturnPct));
+}
+
 const StockPickerPage: React.FC = () => {
   const navigate = useNavigate();
 
@@ -74,18 +111,27 @@ const StockPickerPage: React.FC = () => {
 
   const [templates, setTemplates] = useState<PickerTemplateItem[]>([]);
   const [universes, setUniverses] = useState<PickerUniverseItem[]>([]);
+  const [sectors, setSectors] = useState<PickerSectorItem[]>([]);
   const [tasks, setTasks] = useState<PickerTaskItem[]>([]);
   const [selectedTemplateId, setSelectedTemplateId] = useState('');
   const [selectedUniverseId, setSelectedUniverseId] = useState('watchlist');
+  const [selectedMode, setSelectedMode] = useState<'watchlist' | 'sector'>('watchlist');
+  const [selectedSectorDraft, setSelectedSectorDraft] = useState('');
+  const [selectedSectorIds, setSelectedSectorIds] = useState<string[]>([]);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [taskDetail, setTaskDetail] = useState<PickerTaskDetail | null>(null);
   const [drawerCandidate, setDrawerCandidate] = useState<PickerCandidateItem | null>(null);
   const [limit, setLimit] = useState('20');
+  const [aiTopK, setAiTopK] = useState('5');
   const [forceRefresh, setForceRefresh] = useState(false);
+  const [notify, setNotify] = useState(false);
+  const [statsWindowDays, setStatsWindowDays] = useState('10');
+  const [templateStats, setTemplateStats] = useState<PickerTemplateStatItem[]>([]);
   const [watchlistCodes, setWatchlistCodes] = useState<string[]>([]);
   const [isLoadingMeta, setIsLoadingMeta] = useState(true);
   const [isLoadingTasks, setIsLoadingTasks] = useState(true);
   const [isLoadingDetail, setIsLoadingDetail] = useState(false);
+  const [isLoadingStats, setIsLoadingStats] = useState(true);
   const [isRunning, setIsRunning] = useState(false);
   const [isAddingWatchlist, setIsAddingWatchlist] = useState(false);
   const [isLaunchingAnalysisFor, setIsLaunchingAnalysisFor] = useState<string | null>(null);
@@ -103,12 +149,14 @@ const StockPickerPage: React.FC = () => {
   const loadMeta = useCallback(async () => {
     setIsLoadingMeta(true);
     try {
-      const [templateItems, universeItems] = await Promise.all([
+      const [templateItems, universeItems, sectorItems] = await Promise.all([
         stockPickerApi.getTemplates(),
         stockPickerApi.getUniverses(),
+        stockPickerApi.getSectors(),
       ]);
       setTemplates(templateItems);
       setUniverses(universeItems);
+      setSectors(sectorItems);
       setSelectedTemplateId((previous) => previous || templateItems[0]?.templateId || '');
       setSelectedUniverseId((previous) => {
         if (previous && universeItems.some((item) => item.universeId === previous)) {
@@ -119,11 +167,25 @@ const StockPickerPage: React.FC = () => {
       setWatchlistCodes(
         universeItems.find((item) => item.universeId === 'watchlist')?.codes?.map((code) => code.toUpperCase()) ?? []
       );
+      setSelectedSectorDraft((previous) => previous || sectorItems[0]?.sectorId || '');
       setPageError(null);
     } catch (error: unknown) {
       setPageError(getParsedApiError(error));
     } finally {
       setIsLoadingMeta(false);
+    }
+  }, []);
+
+  const loadStats = useCallback(async (windowDays: number) => {
+    setIsLoadingStats(true);
+    try {
+      const response = await stockPickerApi.getTemplateStats(windowDays);
+      setTemplateStats(response.items ?? []);
+      setPageError(null);
+    } catch (error: unknown) {
+      setPageError(getParsedApiError(error));
+    } finally {
+      setIsLoadingStats(false);
     }
   }, []);
 
@@ -167,6 +229,10 @@ const StockPickerPage: React.FC = () => {
   }, [loadMeta, loadTasks]);
 
   useEffect(() => {
+    void loadStats(Number(statsWindowDays) || 10);
+  }, [loadStats, statsWindowDays]);
+
+  useEffect(() => {
     if (!selectedTaskId) {
       setTaskDetail(null);
       return;
@@ -194,6 +260,15 @@ const StockPickerPage: React.FC = () => {
     if (!selectedTemplateId) {
       return;
     }
+    if (selectedMode === 'sector' && selectedSectorIds.length === 0) {
+      setRunError(createParsedApiError({
+        title: '参数错误',
+        message: '板块模式至少需要选择 1 个行业板块。',
+        status: 400,
+        category: 'http_error',
+      }));
+      return;
+    }
 
     setRunError(null);
     setAnalysisError(null);
@@ -203,18 +278,39 @@ const StockPickerPage: React.FC = () => {
       const response = await stockPickerApi.run({
         templateId: selectedTemplateId,
         universeId: selectedUniverseId,
+        mode: selectedMode,
+        sectorIds: selectedMode === 'sector' ? selectedSectorIds : [],
         limit: Number(limit) || 20,
+        aiTopK: Number(aiTopK) || 5,
         forceRefresh,
+        notify,
       });
       setSelectedTaskId(response.taskId);
       await loadTasks(response.taskId);
       await loadTaskDetail(response.taskId);
       setActionMessage('选股任务已提交，结果会自动刷新。');
+      await loadStats(Number(statsWindowDays) || 10);
     } catch (error: unknown) {
       setRunError(getParsedApiError(error));
     } finally {
       setIsRunning(false);
     }
+  }
+
+  function handleAddSector() {
+    if (!selectedSectorDraft) {
+      return;
+    }
+    setSelectedSectorIds((previous) => {
+      if (previous.includes(selectedSectorDraft) || previous.length >= 5) {
+        return previous;
+      }
+      return [...previous, selectedSectorDraft];
+    });
+  }
+
+  function handleRemoveSector(sectorId: string) {
+    setSelectedSectorIds((previous) => previous.filter((item) => item !== sectorId));
   }
 
   async function handleAddToWatchlist(candidate: PickerCandidateItem) {
@@ -283,13 +379,15 @@ const StockPickerPage: React.FC = () => {
   const selectedTemplate = templates.find((item) => item.templateId === selectedTemplateId) ?? null;
   const selectedUniverse = universes.find((item) => item.universeId === selectedUniverseId) ?? null;
   const selectedUniverseCodes = selectedUniverse?.codes ?? [];
+  const selectedSectorItems = sectors.filter((item) => selectedSectorIds.includes(item.sectorId));
+  const sectorStockCount = selectedSectorItems.reduce((sum, item) => sum + item.stockCount, 0);
 
   return (
     <div className="space-y-5">
       <PageHeader
         eyebrow="AI Stock Picker"
         title="AI 选股"
-        description="V1 使用内置模板扫描当前自选股池，先做结构化打分，再用 AI 解释前排候选。"
+        description="V2 支持自选股模式与 A股行业板块模式，先做结构化筛选与评分，再用 AI 解释前排候选。"
         actions={(
           <>
             <label className="flex items-center gap-2 rounded-xl border border-border/70 bg-card/70 px-3 py-2 text-sm text-secondary-text">
@@ -303,12 +401,29 @@ const StockPickerPage: React.FC = () => {
             <input
               type="number"
               min={1}
-              max={50}
+              max={30}
               value={limit}
               onChange={(event) => setLimit(event.target.value)}
               className={`${INPUT_CLASS} w-24`}
               aria-label="候选数量"
             />
+            <input
+              type="number"
+              min={1}
+              max={8}
+              value={aiTopK}
+              onChange={(event) => setAiTopK(event.target.value)}
+              className={`${INPUT_CLASS} w-24`}
+              aria-label="AI解释数量"
+            />
+            <label className="flex items-center gap-2 rounded-xl border border-border/70 bg-card/70 px-3 py-2 text-sm text-secondary-text">
+              <input
+                type="checkbox"
+                checked={notify}
+                onChange={(event) => setNotify(event.target.checked)}
+              />
+              完成后通知
+            </label>
             <button
               type="button"
               className="btn-primary flex h-11 items-center gap-2"
@@ -333,14 +448,53 @@ const StockPickerPage: React.FC = () => {
       ) : null}
 
       <div className="grid gap-5 xl:grid-cols-[1.2fr_0.8fr]">
-        <SectionCard title="模板与股票池" subtitle="Run Config">
+        <SectionCard title="模板与运行范围" subtitle="Run Config">
           {isLoadingMeta ? (
             <div className="flex items-center gap-3 py-8 text-sm text-secondary-text">
               <RefreshCw className="h-4 w-4 animate-spin" />
-              正在加载模板与股票池...
+              正在加载模板、股票池与板块...
             </div>
           ) : (
             <div className="space-y-5">
+              <div className="grid gap-4 md:grid-cols-3">
+                <button
+                  type="button"
+                  onClick={() => setSelectedMode('watchlist')}
+                  aria-label="自选股模式"
+                  aria-pressed={selectedMode === 'watchlist'}
+                  className={`rounded-2xl border p-4 text-left transition-all ${
+                    selectedMode === 'watchlist'
+                      ? 'border-cyan/50 bg-cyan/10 shadow-[0_0_0_1px_rgba(34,211,238,0.15)]'
+                      : 'border-border/70 bg-card/60 hover:border-border hover:bg-card'
+                  }`}
+                >
+                  <div className="text-sm font-semibold text-foreground">自选股模式</div>
+                  <div className="mt-1 text-xs text-secondary-text">沿用当前 STOCK_LIST 直接选股。</div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSelectedMode('sector')}
+                  aria-label="板块模式"
+                  aria-pressed={selectedMode === 'sector'}
+                  className={`rounded-2xl border p-4 text-left transition-all ${
+                    selectedMode === 'sector'
+                      ? 'border-cyan/50 bg-cyan/10 shadow-[0_0_0_1px_rgba(34,211,238,0.15)]'
+                      : 'border-border/70 bg-card/60 hover:border-border hover:bg-card'
+                  }`}
+                >
+                  <div className="text-sm font-semibold text-foreground">板块模式</div>
+                  <div className="mt-1 text-xs text-secondary-text">先选 A股行业板块，再在板块内选股。</div>
+                </button>
+                <div className="rounded-2xl border border-border/70 bg-card/60 p-4">
+                  <div className="text-sm font-medium text-foreground">本次参数</div>
+                  <div className="mt-2 space-y-1 text-xs text-secondary-text">
+                    <div>候选数量：{limit || '20'}</div>
+                    <div>AI 解释：{aiTopK || '5'}</div>
+                    <div>通知：{notify ? '开启' : '关闭'}</div>
+                  </div>
+                </div>
+              </div>
+
               <div>
                 <div className="mb-3 flex items-center gap-2">
                   <TrendingUp className="h-4 w-4 text-cyan" />
@@ -377,43 +531,89 @@ const StockPickerPage: React.FC = () => {
                 </div>
               </div>
 
-              <div className="grid gap-4 md:grid-cols-2">
-                <Select
-                  label="股票池"
-                  value={selectedUniverseId}
-                  onChange={setSelectedUniverseId}
-                  options={universes.map((item) => ({
-                    value: item.universeId,
-                    label: `${item.name} (${item.stockCount})`,
-                  }))}
-                  disabled={universes.length <= 1}
-                  className="max-w-md"
-                />
-                <div className="rounded-2xl border border-border/70 bg-card/60 p-4">
-                  <div className="text-sm font-medium text-foreground">当前范围说明</div>
-                  <div className="mt-2 text-sm text-secondary-text">
-                    V1 仅支持基于 `STOCK_LIST` 扫描当前自选股池，不做全市场扫描。
+              {selectedMode === 'watchlist' ? (
+                <div className="grid gap-4 md:grid-cols-2">
+                  <Select
+                    label="股票池"
+                    value={selectedUniverseId}
+                    onChange={setSelectedUniverseId}
+                    options={universes.map((item) => ({
+                      value: item.universeId,
+                      label: `${item.name} (${item.stockCount})`,
+                    }))}
+                    disabled={universes.length <= 1}
+                    className="max-w-md"
+                  />
+                  <div className="rounded-2xl border border-border/70 bg-card/60 p-4">
+                    <div className="text-sm font-medium text-foreground">当前范围说明</div>
+                    <div className="mt-2 text-sm text-secondary-text">
+                      自选股模式基于 `STOCK_LIST` 扫描当前自选股池，不做全市场扫描。
+                    </div>
                   </div>
                 </div>
-              </div>
+              ) : (
+                <div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_auto]">
+                  <Select
+                    label="A股行业板块"
+                    value={selectedSectorDraft}
+                    onChange={setSelectedSectorDraft}
+                    options={sectors.map((item) => ({
+                      value: item.sectorId,
+                      label: `${item.name} (${item.stockCount})`,
+                    }))}
+                    placeholder={sectors.length ? '请选择行业板块' : '暂无可用板块'}
+                    disabled={sectors.length === 0 || selectedSectorIds.length >= 5}
+                  />
+                  <button
+                    type="button"
+                    className="btn-secondary mt-7 h-11"
+                    onClick={handleAddSector}
+                    disabled={!selectedSectorDraft || selectedSectorIds.includes(selectedSectorDraft) || selectedSectorIds.length >= 5}
+                  >
+                    添加板块
+                  </button>
+                </div>
+              )}
 
               <div className="rounded-2xl border border-border/70 bg-card/60 p-4">
                 <div className="flex items-start justify-between gap-3">
                   <div>
                     <div className="label-uppercase">Universe</div>
                     <h3 className="mt-1 text-base font-semibold text-foreground">
-                      {selectedUniverse?.name ?? '当前自选股池'}
+                      {selectedMode === 'sector' ? 'A股行业板块' : selectedUniverse?.name ?? '当前自选股池'}
                     </h3>
                     <p className="mt-1 text-sm text-secondary-text">
-                      {selectedUniverse?.description ?? 'V1 仅支持使用 STOCK_LIST 作为股票池。'}
+                      {selectedMode === 'sector'
+                        ? '板块模式仅支持手动选择 A股行业板块，再在板块内做结构化筛选。'
+                        : selectedUniverse?.description ?? '基于 STOCK_LIST 扫描当前自选股池。'}
                     </p>
                   </div>
-                  <Badge variant="info">{selectedUniverse?.stockCount ?? 0} 支</Badge>
+                  <Badge variant="info">{selectedMode === 'sector' ? sectorStockCount : selectedUniverse?.stockCount ?? 0} 支</Badge>
                 </div>
-                <p className="mt-3 text-xs text-muted-text">
-                  当前股票池预览：{selectedUniverseCodes.slice(0, 8).join('、') || '--'}
-                  {selectedUniverseCodes.length > 8 ? ' ...' : ''}
-                </p>
+                {selectedMode === 'sector' ? (
+                  <div className="mt-3 space-y-3">
+                    <p className="text-xs text-muted-text">
+                      已选板块：{selectedSectorItems.map((item) => item.name).join('、') || '--'}
+                    </p>
+                    <div className="flex flex-wrap gap-2">
+                      {selectedSectorItems.map((item) => (
+                        <button
+                          key={item.sectorId}
+                          type="button"
+                          className="rounded-full border border-border/70 bg-background/40 px-3 py-1 text-xs text-secondary-text transition-colors hover:border-border hover:text-foreground"
+                          onClick={() => handleRemoveSector(item.sectorId)}
+                        >
+                          {item.name} ×
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ) : (
+                  <p className="mt-3 text-xs text-muted-text">
+                    当前股票池预览：{selectedUniverseCodes.slice(0, 8).join('、') || '--'}
+                    {selectedUniverseCodes.length > 8 ? ' ...' : ''}
+                  </p>
+                )}
                 {selectedTemplate ? (
                   <div className="mt-4 rounded-xl border border-border/60 bg-background/40 p-3">
                     <div className="mb-2 text-xs font-medium text-secondary-text">评分重点</div>
@@ -472,11 +672,17 @@ const StockPickerPage: React.FC = () => {
                       <div>
                         <div className="text-sm font-semibold text-foreground">{task.templateName}</div>
                         <div className="mt-1 text-xs text-secondary-text">
-                          {formatDate(task.createdAt)} · {task.candidateCount} 个结果
+                          {formatDate(task.createdAt)} · {pickerModeLabel(task.mode)} · {task.candidateCount} 个结果
                         </div>
                       </div>
                       {statusBadge(task.status)}
                     </div>
+                    {task.sectorNames.length > 0 ? (
+                      <div className="mt-2 text-xs text-muted-text">
+                        {task.sectorNames.slice(0, 3).join('、')}
+                        {task.sectorNames.length > 3 ? ' ...' : ''}
+                      </div>
+                    ) : null}
                     <div className="mt-3 h-2 rounded-full bg-background/60">
                       <div
                         className="h-full rounded-full bg-primary-gradient transition-all"
@@ -504,8 +710,10 @@ const StockPickerPage: React.FC = () => {
               <div className="flex flex-wrap items-center gap-2">
                 {statusBadge(selectedTask.status)}
                 <Badge variant="default">{selectedTask.templateName}</Badge>
+                <Badge variant="default">{selectedTask.modeLabel ?? pickerModeLabel(selectedTask.mode)}</Badge>
                 <Badge variant="default">{selectedTask.universeName}</Badge>
                 {selectedTask.forceRefresh ? <Badge variant="warning">强制刷新</Badge> : null}
+                {selectedTask.notify ? <Badge variant="info">完成后通知</Badge> : null}
               </div>
 
               {selectedTask.errorMessage ? (
@@ -565,12 +773,24 @@ const StockPickerPage: React.FC = () => {
                 <div className="rounded-2xl border border-border/70 bg-card/60 p-4">
                   <div className="text-sm font-medium text-foreground">运行结果</div>
                   <div className="mt-3 space-y-2 text-xs text-secondary-text">
+                    <div>模式：{selectedTask.modeLabel ?? pickerModeLabel(selectedTask.mode)}</div>
+                    <div>AI解释：Top {selectedTask.aiTopK}</div>
                     <div>补位候选：{selectedTask.summary.fallbackCount}</div>
                     <div>数据不足：{selectedTask.summary.insufficientCount}</div>
                     <div>扫描异常：{selectedTask.summary.errorCount}</div>
                   </div>
                 </div>
               </div>
+              {selectedTask.sectorNames.length > 0 ? (
+                <div className="rounded-2xl border border-border/70 bg-card/60 p-4">
+                  <div className="text-sm font-medium text-foreground">板块范围</div>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {selectedTask.sectorNames.map((item) => (
+                      <Badge key={item} variant="default">{item}</Badge>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
             </div>
           )}
         </SectionCard>
@@ -667,6 +887,69 @@ const StockPickerPage: React.FC = () => {
         </SectionCard>
       </div>
 
+      <SectionCard
+        title="模板效果统计"
+        subtitle="A-share Validation"
+        actions={(
+          <Select
+            label="统计窗口"
+            value={statsWindowDays}
+            onChange={(value) => setStatsWindowDays(value)}
+            options={[
+              { value: '5', label: '5日' },
+              { value: '10', label: '10日' },
+              { value: '20', label: '20日' },
+            ]}
+            className="min-w-28"
+          />
+        )}
+      >
+        {isLoadingStats ? (
+          <div className="flex items-center gap-3 py-8 text-sm text-secondary-text">
+            <RefreshCw className="h-4 w-4 animate-spin" />
+            正在加载模板统计...
+          </div>
+        ) : templateStats.length === 0 ? (
+          <EmptyState
+            title="暂无统计数据"
+            description="完成更多 A股选股任务后，这里会展示各模板的胜率、收益率与回撤表现。"
+          />
+        ) : (
+          <div className="space-y-3">
+            {templateStats.map((item) => (
+              <div
+                key={`${item.templateId}-${item.windowDays}`}
+                className="grid gap-3 rounded-2xl border border-border/70 bg-card/60 p-4 md:grid-cols-6"
+              >
+                <div>
+                  <div className="text-sm font-semibold text-foreground">{item.templateName}</div>
+                  <div className="mt-1 text-xs text-secondary-text">{item.totalEvaluations} 次评估</div>
+                </div>
+                <div className="text-sm text-secondary-text">
+                  <div className="label-uppercase">胜率</div>
+                  <div className="mt-1 font-semibold text-foreground">{formatPct(item.winRatePct)}</div>
+                </div>
+                <div className="text-sm text-secondary-text">
+                  <div className="label-uppercase">平均收益</div>
+                  <div className="mt-1 font-semibold text-foreground">{formatPct(item.avgReturnPct)}</div>
+                </div>
+                <div className="text-sm text-secondary-text">
+                  <div className="label-uppercase">平均超额</div>
+                  <div className="mt-1 font-semibold text-foreground">{formatPct(item.avgExcessReturnPct)}</div>
+                </div>
+                <div className="text-sm text-secondary-text">
+                  <div className="label-uppercase">平均回撤</div>
+                  <div className="mt-1 font-semibold text-foreground">{formatPct(item.avgMaxDrawdownPct)}</div>
+                </div>
+                <div className="text-xs text-muted-text md:text-right">
+                  基准：沪深300
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </SectionCard>
+
       <Drawer
         isOpen={Boolean(drawerCandidate)}
         onClose={() => setDrawerCandidate(null)}
@@ -742,6 +1025,47 @@ const StockPickerPage: React.FC = () => {
                   ))}
                 </div>
               </div>
+            </div>
+
+            <div className="rounded-2xl border border-border/70 bg-card/60 p-4">
+              <div>
+                <div className="text-sm font-medium text-foreground">后验表现</div>
+                <div className="mt-1 text-xs text-secondary-text">
+                  固定观察窗口：5 / 10 / 20 日；超额收益基准为沪深300。
+                </div>
+              </div>
+              {drawerCandidate.evaluations.length > 0 ? (
+                <div className="mt-4 grid gap-3 md:grid-cols-3">
+                  {drawerCandidate.evaluations.map((item) => (
+                    <div
+                      key={`${drawerCandidate.code}-${item.windowDays}`}
+                      className="rounded-xl border border-border/60 bg-background/30 p-3"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="text-sm font-semibold text-foreground">{item.windowDays}日窗口</div>
+                        {evaluationStatusBadge(item.evalStatus)}
+                      </div>
+                      <div className="mt-3 space-y-1.5 text-xs text-secondary-text">
+                        <div>入场：{formatDate(item.entryDate)} / {formatNumber(item.entryPrice, 2)}</div>
+                        <div>出场：{formatDate(item.exitDate)} / {formatNumber(item.exitPrice, 2)}</div>
+                        <div>收益率：{formatPct(item.returnPct)}</div>
+                        <div>基准收益：{formatPct(item.benchmarkReturnPct)}</div>
+                        <div>超额收益：{formatPct(item.excessReturnPct)}</div>
+                        <div>最大回撤：{formatPct(item.maxDrawdownPct)}</div>
+                      </div>
+                      {!hasComparableBenchmark(item) && item.evalStatus === 'completed' ? (
+                        <div className="mt-3 text-xs text-muted-text">
+                          当前窗口已完成个股收益计算，但基准收益暂不可用。
+                        </div>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="mt-4 text-sm text-secondary-text">
+                  暂无后验表现。若任务完成时间较近，系统会在后续窗口到齐后自动补算。
+                </div>
+              )}
             </div>
 
             <div className="rounded-2xl border border-border/70 bg-card/60 p-4">

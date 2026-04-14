@@ -69,6 +69,17 @@ class _FakeRepo:
         return list(self.rows)
 
 
+class _CaptureRepo:
+    def __init__(self) -> None:
+        self.created = None
+
+    def mark_incomplete_tasks_failed(self) -> int:
+        return 0
+
+    def create_task(self, **kwargs) -> None:
+        self.created = kwargs
+
+
 class _FakeStockRepo:
     def __init__(self) -> None:
         self.saved = []
@@ -94,7 +105,137 @@ class _FakeFetcherManager:
         return []
 
 
+class _FakeExecutor:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def submit(self, fn, *args, **kwargs):
+        self.calls.append((fn, args, kwargs))
+        return object()
+
+
 class TestStockPickerService(unittest.TestCase):
+    def test_build_sector_catalog_from_stock_list_with_industry(self) -> None:
+        frame = pd.DataFrame(
+            [
+                {"code": "600519", "name": "贵州茅台", "industry": "白酒"},
+                {"code": "000858", "name": "五粮液", "industry": "白酒"},
+                {"code": "600036", "name": "招商银行", "industry": "银行"},
+                {"code": "AAPL", "name": "Apple", "industry": "US"},
+            ]
+        )
+
+        class _Fetcher:
+            name = "fake"
+
+            def get_stock_list(self):
+                return frame
+
+        manager = object.__new__(_FakeFetcherManager)
+        manager._fetchers = [_Fetcher()]
+        manager._fetchers_lock = None
+        manager._fetcher_call_locks = None
+        manager._fetcher_call_locks_lock = None
+        manager._stock_name_cache = None
+        manager._stock_name_cache_lock = None
+
+        catalog = StockPickerService._build_sector_catalog(manager)
+
+        self.assertEqual([item["name"] for item in catalog["items"]], ["白酒", "银行"])
+        self.assertEqual(catalog["items"][0]["stock_count"], 2)
+        self.assertEqual(catalog["code_by_sector"]["白酒"], ["600519", "000858"])
+
+    def test_submit_task_accepts_sector_mode_with_controlled_parameters(self) -> None:
+        service = object.__new__(StockPickerService)
+        capture_repo = _CaptureRepo()
+        service._repo = capture_repo
+        service._executor = _FakeExecutor()
+        service._futures = {}
+        service._futures_lock = unittest.mock.MagicMock()
+        service._load_sector_catalog = Mock(return_value={
+            "items": [
+                {"sector_id": "白酒", "name": "白酒", "market": "cn", "stock_count": 2},
+                {"sector_id": "银行", "name": "银行", "market": "cn", "stock_count": 1},
+            ],
+            "code_by_sector": {"白酒": ["600519", "000858"], "银行": ["600036"]},
+        })
+
+        payload = service.submit_task(
+            template_id="balanced",
+            template_overrides={},
+            universe_id="watchlist",
+            mode="sector",
+            sector_ids=["白酒", "银行"],
+            limit=12,
+            ai_top_k=4,
+            force_refresh=True,
+            notify=True,
+        )
+
+        self.assertEqual(payload["status"], "queued")
+        self.assertIsNotNone(capture_repo.created)
+        self.assertEqual(capture_repo.created["universe_id"], "sector")
+        self.assertEqual(capture_repo.created["ai_top_k"], 4)
+        self.assertTrue(capture_repo.created["request_payload"]["notify"])
+        self.assertEqual(capture_repo.created["request_payload"]["sector_ids"], ["白酒", "银行"])
+        self.assertEqual(capture_repo.created["request_payload"]["sector_names"], ["白酒", "银行"])
+
+    def test_get_task_refreshes_completed_evaluations_before_returning(self) -> None:
+        service = object.__new__(StockPickerService)
+        first_payload = {
+            "task_id": "picker-task-1",
+            "template_id": "balanced",
+            "status": "completed",
+            "universe_id": "watchlist",
+            "request_payload": {"mode": "watchlist"},
+        }
+        second_payload = {
+            **first_payload,
+            "candidates": [{"code": "600519", "evaluations": [{"window_days": 5, "eval_status": "completed"}]}],
+        }
+        service._repo = Mock()
+        service._repo.get_task.side_effect = [first_payload, second_payload]
+        service._ensure_task_evaluations = Mock()
+        service._decorate_task = Mock(side_effect=lambda payload: payload)
+
+        payload = StockPickerService.get_task(service, "picker-task-1")
+
+        self.assertIsNotNone(payload)
+        service._ensure_task_evaluations.assert_called_once_with("picker-task-1")
+        self.assertEqual(service._repo.get_task.call_count, 2)
+        self.assertEqual(payload["candidates"][0]["evaluations"][0]["window_days"], 5)
+
+    def test_list_template_stats_uses_comparable_rows_for_win_rate(self) -> None:
+        service = object.__new__(StockPickerService)
+        service._repo = Mock()
+        service._ensure_template_evaluations = Mock()
+        service._repo.list_evaluation_rows_for_window.return_value = [
+            {
+                "market": "cn",
+                "template_id": "balanced",
+                "eval_status": "completed",
+                "return_pct": 4.0,
+                "excess_return_pct": None,
+                "max_drawdown_pct": 2.0,
+            },
+            {
+                "market": "cn",
+                "template_id": "balanced",
+                "eval_status": "completed",
+                "return_pct": 6.0,
+                "excess_return_pct": 1.5,
+                "max_drawdown_pct": 3.0,
+            },
+        ]
+
+        payload = StockPickerService.list_template_stats(service, window_days=5)
+        balanced_row = next(item for item in payload["items"] if item["template_id"] == "balanced")
+
+        self.assertEqual(balanced_row["total_evaluations"], 2)
+        self.assertEqual(balanced_row["win_rate_pct"], 100.0)
+        self.assertEqual(balanced_row["avg_return_pct"], 5.0)
+        self.assertEqual(balanced_row["avg_excess_return_pct"], 1.5)
+
     def test_build_ai_explanation_uses_compact_prompt_payloads(self) -> None:
         service = object.__new__(StockPickerService)
         analyzer = _FakeAnalyzer()

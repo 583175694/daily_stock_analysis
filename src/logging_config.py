@@ -46,7 +46,29 @@ DEFAULT_QUIET_LOGGERS = [
     'sqlalchemy',
     'google',
     'httpx',
+    'litellm',
+    'LiteLLM',
 ]
+
+
+def _configure_litellm_runtime_logging() -> None:
+    """Best-effort LiteLLM log suppression for success-path debug noise."""
+    try:
+        import litellm  # type: ignore
+    except Exception:
+        return
+
+    if hasattr(litellm, "set_verbose"):
+        try:
+            litellm.set_verbose = False
+        except Exception:
+            pass
+
+    if hasattr(litellm, "suppress_debug_info"):
+        try:
+            litellm.suppress_debug_info = True
+        except Exception:
+            pass
 
 
 def setup_logging(
@@ -127,6 +149,7 @@ def setup_logging(
     root_logger.addHandler(debug_handler)
 
     # 降低第三方库的日志级别
+    _configure_litellm_runtime_logging()
     quiet_loggers = DEFAULT_QUIET_LOGGERS.copy()
     if extra_quiet_loggers:
         quiet_loggers.extend(extra_quiet_loggers)

@@ -480,6 +480,35 @@ class PickerCandidateScore(Base):
     )
 
 
+class PickerCandidateEvaluation(Base):
+    """AI 选股候选后验评估结果。"""
+
+    __tablename__ = 'picker_candidate_evaluations'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    picker_candidate_id = Column(Integer, ForeignKey('picker_candidates.id'), nullable=False, index=True)
+    window_days = Column(Integer, nullable=False, index=True)
+    benchmark_code = Column(String(16), nullable=False, default='000300')
+    eval_status = Column(String(24), nullable=False, default='pending', index=True)
+    entry_date = Column(Date)
+    entry_price = Column(Float)
+    exit_date = Column(Date)
+    exit_price = Column(Float)
+    benchmark_entry_price = Column(Float)
+    benchmark_exit_price = Column(Float)
+    return_pct = Column(Float)
+    benchmark_return_pct = Column(Float)
+    excess_return_pct = Column(Float)
+    max_drawdown_pct = Column(Float)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('picker_candidate_id', 'window_days', name='uix_picker_candidate_eval_window'),
+        Index('ix_picker_candidate_eval_status_window', 'eval_status', 'window_days'),
+    )
+
+
 class PortfolioAccount(Base):
     """Portfolio account metadata."""
 

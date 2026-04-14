@@ -5,14 +5,16 @@ import logging
 import re
 import threading
 import uuid
+from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import pandas as pd
 
 from data_provider.base import DataFetcherManager, canonical_stock_code, normalize_stock_code
+from src.notification import NotificationService
 from src.analyzer import GeminiAnalyzer
 from src.config import get_config
 from src.core.trading_calendar import get_effective_trading_date, get_market_for_stock
@@ -22,6 +24,9 @@ from src.stock_picker.repository import StockPickerRepository
 from src.stock_picker.templates import get_template, list_templates
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_PICKER_BENCHMARK_CODE = "000300"
+PICKER_EVAL_WINDOWS = (5, 10, 20)
 
 _POSITIVE_NEWS_KEYWORDS = (
     "增持", "回购", "中标", "签约", "订单", "突破", "预增", "超预期", "新高",
@@ -166,6 +171,8 @@ class StockPickerService:
         self._executor: Optional[ThreadPoolExecutor] = None
         self._futures: Dict[str, Future[Any]] = {}
         self._futures_lock = threading.Lock()
+        self._sector_cache_lock = threading.Lock()
+        self._sector_catalog_cache: Optional[Dict[str, Any]] = None
         recovered = self._repo.mark_incomplete_tasks_failed()
         if recovered:
             logger.info("[StockPicker] recovered %s incomplete task(s)", recovered)
@@ -197,30 +204,118 @@ class StockPickerService:
             {
                 "universe_id": "watchlist",
                 "name": "当前自选股池",
-                "description": "V1 仅支持使用 STOCK_LIST 作为选股范围。",
+                "description": "基于 STOCK_LIST 扫描当前自选股池。",
                 "stock_count": len(stock_codes),
                 "codes": stock_codes,
             }
         ]
+
+    def list_sectors(self) -> List[Dict[str, object]]:
+        catalog = self._load_sector_catalog()
+        return list(catalog["items"])
+
+    def list_template_stats(self, *, window_days: int) -> Dict[str, Any]:
+        if window_days not in PICKER_EVAL_WINDOWS:
+            raise ValueError(f"window_days 必须为 {', '.join(str(item) for item in PICKER_EVAL_WINDOWS)} 之一。")
+
+        self._ensure_template_evaluations(window_days=window_days)
+        rows = self._repo.list_evaluation_rows_for_window(window_days)
+        grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            if row["market"] != "cn" or row["eval_status"] != "completed":
+                continue
+            grouped[str(row["template_id"])].append(row)
+
+        items: List[Dict[str, Any]] = []
+        for template in list_templates():
+            template_rows = grouped.get(str(template["template_id"]), [])
+            total = len(template_rows)
+            if total == 0:
+                items.append(
+                    {
+                        "template_id": template["template_id"],
+                        "template_name": template["name"],
+                        "window_days": window_days,
+                        "total_evaluations": 0,
+                        "win_rate_pct": None,
+                        "avg_return_pct": None,
+                        "avg_excess_return_pct": None,
+                        "avg_max_drawdown_pct": None,
+                    }
+                )
+                continue
+
+            comparable_rows = [row for row in template_rows if row.get("excess_return_pct") is not None]
+            win_count = sum(1 for row in comparable_rows if float(row.get("excess_return_pct") or 0.0) > 0)
+            avg_return = sum(float(row.get("return_pct") or 0.0) for row in template_rows) / total
+            excess_rows = [float(row["excess_return_pct"]) for row in template_rows if row.get("excess_return_pct") is not None]
+            drawdown_rows = [float(row["max_drawdown_pct"]) for row in template_rows if row.get("max_drawdown_pct") is not None]
+            items.append(
+                {
+                    "template_id": template["template_id"],
+                    "template_name": template["name"],
+                    "window_days": window_days,
+                    "total_evaluations": total,
+                    "win_rate_pct": round(win_count / len(comparable_rows) * 100, 2) if comparable_rows else None,
+                    "avg_return_pct": round(avg_return, 2),
+                    "avg_excess_return_pct": round(sum(excess_rows) / len(excess_rows), 2) if excess_rows else None,
+                    "avg_max_drawdown_pct": round(sum(drawdown_rows) / len(drawdown_rows), 2) if drawdown_rows else None,
+                }
+            )
+
+        return {
+            "window_days": window_days,
+            "benchmark_code": DEFAULT_PICKER_BENCHMARK_CODE,
+            "items": items,
+        }
 
     def submit_task(
         self,
         *,
         template_id: str,
         universe_id: str,
+        mode: str,
+        sector_ids: Optional[Sequence[str]],
         limit: int,
+        ai_top_k: int,
         force_refresh: bool,
+        notify: bool,
         template_overrides: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if template_overrides:
-            raise ValueError("V1 暂不支持自定义模板参数，请直接使用内置模板。")
+            raise ValueError("V2 暂不支持复杂模板参数，请使用顶部的数量参数。")
         get_template(template_id)
-        if universe_id != "watchlist":
-            raise ValueError("V1 仅支持 watchlist 股票池。")
-
+        task_mode = str(mode or "watchlist").strip().lower()
+        if task_mode not in {"watchlist", "sector"}:
+            raise ValueError("mode 仅支持 watchlist 或 sector。")
+        if task_mode == "watchlist" and universe_id != "watchlist":
+            raise ValueError("自选股模式仅支持 watchlist 股票池。")
+        if task_mode == "sector":
+            universe_id = "sector"
         task_limit = int(limit or 20)
-        if task_limit < 1 or task_limit > 50:
-            raise ValueError("limit 必须介于 1 和 50 之间。")
+        if task_limit < 1 or task_limit > 30:
+            raise ValueError("limit 必须介于 1 和 30 之间。")
+        task_ai_top_k = int(ai_top_k or 5)
+        if task_ai_top_k < 1 or task_ai_top_k > 8:
+            raise ValueError("ai_top_k 必须介于 1 和 8 之间。")
+        if task_ai_top_k > task_limit:
+            raise ValueError("ai_top_k 不能大于 limit。")
+
+        selected_sector_ids: List[str] = []
+        selected_sector_names: List[str] = []
+        if task_mode == "sector":
+            selected_sector_ids = [str(item).strip() for item in (sector_ids or []) if str(item).strip()]
+            selected_sector_ids = list(dict.fromkeys(selected_sector_ids))
+            if not selected_sector_ids:
+                raise ValueError("板块模式至少需要选择 1 个板块。")
+            if len(selected_sector_ids) > 5:
+                raise ValueError("板块模式最多选择 5 个板块。")
+            catalog = self._load_sector_catalog()
+            available_by_id = {str(item["sector_id"]): item for item in catalog["items"]}
+            missing = [item for item in selected_sector_ids if item not in available_by_id]
+            if missing:
+                raise ValueError(f"存在无效板块：{', '.join(missing)}")
+            selected_sector_names = [str(available_by_id[item]["name"]) for item in selected_sector_ids]
 
         task_id = uuid.uuid4().hex
         self._repo.create_task(
@@ -228,13 +323,18 @@ class StockPickerService:
             template_id=template_id,
             universe_id=universe_id,
             limit=task_limit,
-            ai_top_k=min(10, task_limit),
+            ai_top_k=task_ai_top_k,
             force_refresh=bool(force_refresh),
             request_payload={
                 "template_id": template_id,
                 "universe_id": universe_id,
                 "limit": task_limit,
+                "ai_top_k": task_ai_top_k,
+                "mode": task_mode,
+                "sector_ids": selected_sector_ids,
+                "sector_names": selected_sector_names,
                 "force_refresh": bool(force_refresh),
+                "notify": bool(notify),
                 "template_overrides": {},
             },
         )
@@ -252,13 +352,31 @@ class StockPickerService:
         payload = self._repo.get_task(task_id, include_candidates=True)
         if payload is None:
             return None
+        if payload.get("status") == "completed":
+            try:
+                self._ensure_task_evaluations(task_id)
+                payload = self._repo.get_task(task_id, include_candidates=True) or payload
+            except Exception as exc:
+                logger.warning("[StockPicker] refresh evaluations failed for %s: %s", task_id, exc, exc_info=True)
         return self._decorate_task(payload)
 
     def _decorate_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         task = deepcopy(payload)
         template = get_template(task["template_id"])
+        request_payload = task.get("request_payload") or {}
+        task_mode = str(request_payload.get("mode") or ("sector" if task["universe_id"] == "sector" else "watchlist"))
         task["template_name"] = template.name
-        task["universe_name"] = "当前自选股池" if task["universe_id"] == "watchlist" else task["universe_id"]
+        task["mode"] = task_mode
+        task["mode_label"] = "板块模式" if task_mode == "sector" else "自选股模式"
+        task["notify"] = bool(request_payload.get("notify", False))
+        task["sector_ids"] = [str(item) for item in request_payload.get("sector_ids") or []]
+        task["sector_names"] = [str(item) for item in request_payload.get("sector_names") or []]
+        if task["universe_id"] == "watchlist":
+            task["universe_name"] = "当前自选股池"
+        elif task["universe_id"] == "sector":
+            task["universe_name"] = "A股行业板块"
+        else:
+            task["universe_name"] = task["universe_id"]
         task["status_label"] = {
             "queued": "排队中",
             "running": "运行中",
@@ -267,6 +385,29 @@ class StockPickerService:
         }.get(task["status"], task["status"])
         return task
 
+    def _resolve_task_stock_codes(
+        self,
+        *,
+        task_mode: str,
+        universe_id: str,
+        sector_ids: Sequence[str],
+    ) -> Tuple[List[str], List[str]]:
+        if task_mode == "sector":
+            catalog = self._load_sector_catalog()
+            code_by_sector = catalog["code_by_sector"]
+            sector_names = [str(item) for item in sector_ids if str(item) in code_by_sector]
+            stock_codes: List[str] = []
+            for sector_name in sector_names:
+                stock_codes.extend(code_by_sector.get(sector_name, []))
+            return _dedupe_codes(stock_codes), sector_names
+
+        config = get_config()
+        config.refresh_stock_list()
+        stock_codes = _dedupe_codes(config.stock_list)
+        if universe_id != "watchlist":
+            logger.warning("[StockPicker] unexpected universe %s for watchlist mode", universe_id)
+        return stock_codes, []
+
     def _run_task(self, task_id: str) -> None:
         try:
             task = self._repo.get_task(task_id, include_candidates=False)
@@ -274,9 +415,13 @@ class StockPickerService:
                 return
 
             template = get_template(task["template_id"])
-            config = get_config()
-            config.refresh_stock_list()
-            stock_codes = _dedupe_codes(config.stock_list)
+            request_payload = task.get("request_payload") or {}
+            task_mode = str(request_payload.get("mode") or ("sector" if task["universe_id"] == "sector" else "watchlist"))
+            stock_codes, selected_sector_names = self._resolve_task_stock_codes(
+                task_mode=task_mode,
+                universe_id=task["universe_id"],
+                sector_ids=request_payload.get("sector_ids") or [],
+            )
             self._repo.start_task(task_id, total_stocks=len(stock_codes))
 
             if not stock_codes:
@@ -398,6 +543,8 @@ class StockPickerService:
                 "template_id": template.template_id,
                 "template_name": template.name,
                 "universe_id": task["universe_id"],
+                "mode": task_mode,
+                "sector_names": selected_sector_names,
                 "total_stocks": len(stock_codes),
                 "scored_count": len(scored_candidates),
                 "insufficient_count": insufficient_count,
@@ -408,6 +555,15 @@ class StockPickerService:
                 "explained_count": explain_count,
             }
             self._repo.save_candidates(task_id, summary=summary, candidates=selected_candidates)
+            self._ensure_task_evaluations(task_id)
+            if bool(request_payload.get("notify", False)):
+                self._send_task_notification(
+                    task_id=task_id,
+                    template_name=template.name,
+                    mode=task_mode,
+                    sector_names=selected_sector_names,
+                    candidates=selected_candidates,
+                )
         except Exception as exc:
             logger.error("[StockPicker] task %s failed: %s", task_id, exc, exc_info=True)
             self._repo.fail_task(task_id, error_message=str(exc) or "AI 选股任务执行失败")
@@ -926,6 +1082,293 @@ class StockPickerService:
         except Exception as exc:
             logger.debug("[StockPicker] load sector rankings failed: %s", exc)
             return [], []
+
+    def _load_sector_catalog(self) -> Dict[str, Any]:
+        cached = self._sector_catalog_cache
+        if cached is not None:
+            return cached
+
+        with self._sector_cache_lock:
+            if self._sector_catalog_cache is not None:
+                return self._sector_catalog_cache
+
+            fetcher_manager = DataFetcherManager()
+            catalog = self._build_sector_catalog(fetcher_manager)
+            self._sector_catalog_cache = catalog
+            return catalog
+
+    @staticmethod
+    def _build_sector_catalog(fetcher_manager: DataFetcherManager) -> Dict[str, Any]:
+        get_fetchers_snapshot = getattr(fetcher_manager, "_get_fetchers_snapshot", None)
+        if callable(get_fetchers_snapshot):
+            fetchers = get_fetchers_snapshot()
+        else:
+            fetchers = list(getattr(fetcher_manager, "_fetchers", []))
+
+        call_fetcher_method = getattr(fetcher_manager, "_call_fetcher_method", None)
+        for fetcher in fetchers:
+            if not hasattr(fetcher, "get_stock_list"):
+                continue
+            try:
+                if callable(call_fetcher_method):
+                    raw_df = call_fetcher_method(fetcher, "get_stock_list")
+                else:
+                    raw_df = fetcher.get_stock_list()
+            except Exception as exc:
+                logger.debug("[StockPicker] stock list fetch failed from %s: %s", getattr(fetcher, "name", fetcher), exc)
+                continue
+            if raw_df is None or raw_df.empty or "industry" not in raw_df.columns or "code" not in raw_df.columns:
+                continue
+
+            frame = raw_df.copy()
+            frame["code"] = frame["code"].astype(str).map(normalize_stock_code)
+            frame["industry"] = frame["industry"].astype(str).str.strip()
+            frame = frame[
+                frame["code"].str.fullmatch(r"\d{6}", na=False)
+                & frame["industry"].ne("")
+                & frame["industry"].ne("nan")
+            ]
+            if frame.empty:
+                continue
+
+            grouped = frame.groupby("industry")["code"].apply(list)
+            items: List[Dict[str, Any]] = []
+            code_by_sector: Dict[str, List[str]] = {}
+            for industry_name, codes in grouped.items():
+                deduped_codes = _dedupe_codes(codes)
+                if not deduped_codes:
+                    continue
+                code_by_sector[str(industry_name)] = deduped_codes
+                items.append(
+                    {
+                        "sector_id": str(industry_name),
+                        "name": str(industry_name),
+                        "market": "cn",
+                        "stock_count": len(deduped_codes),
+                    }
+                )
+
+            items.sort(key=lambda item: (-int(item["stock_count"]), str(item["name"])))
+            if items:
+                return {
+                    "items": items,
+                    "code_by_sector": code_by_sector,
+                }
+
+        logger.warning("[StockPicker] no A-share sector catalog available from current data sources")
+        return {"items": [], "code_by_sector": {}}
+
+    def _ensure_task_evaluations(self, task_id: str) -> None:
+        for window_days in PICKER_EVAL_WINDOWS:
+            self._ensure_task_window_evaluations(task_id=task_id, window_days=window_days)
+
+    def _ensure_template_evaluations(self, *, window_days: int) -> None:
+        completed_task_ids = self._repo.list_task_ids(status="completed")
+        for task_id in completed_task_ids:
+            self._ensure_task_window_evaluations(task_id=task_id, window_days=window_days)
+
+    def _ensure_task_window_evaluations(self, *, task_id: str, window_days: int) -> None:
+        candidate_rows = self._repo.get_task_candidate_rows(task_id)
+        if not candidate_rows:
+            return
+
+        existing = {
+            (int(item["candidate_id"]), int(item["window_days"])): item
+            for item in self._repo.list_task_evaluations(task_id, window_days=window_days)
+        }
+        fetcher_manager = DataFetcherManager()
+        for candidate in candidate_rows:
+            if candidate["market"] != "cn" or not candidate.get("latest_date"):
+                continue
+            key = (int(candidate["candidate_id"]), int(window_days))
+            existing_payload = existing.get(key)
+            if existing_payload and existing_payload.get("eval_status") == "completed":
+                continue
+            payload = self._evaluate_candidate_window(
+                code=str(candidate["code"]),
+                analysis_date=candidate["latest_date"],
+                window_days=window_days,
+                fetcher_manager=fetcher_manager,
+            )
+            self._repo.upsert_candidate_evaluation(
+                picker_candidate_id=int(candidate["candidate_id"]),
+                window_days=window_days,
+                benchmark_code=DEFAULT_PICKER_BENCHMARK_CODE,
+                eval_status=str(payload["eval_status"]),
+                entry_date=payload.get("entry_date"),
+                entry_price=payload.get("entry_price"),
+                exit_date=payload.get("exit_date"),
+                exit_price=payload.get("exit_price"),
+                benchmark_entry_price=payload.get("benchmark_entry_price"),
+                benchmark_exit_price=payload.get("benchmark_exit_price"),
+                return_pct=payload.get("return_pct"),
+                benchmark_return_pct=payload.get("benchmark_return_pct"),
+                excess_return_pct=payload.get("excess_return_pct"),
+                max_drawdown_pct=payload.get("max_drawdown_pct"),
+            )
+
+    def _evaluate_candidate_window(
+        self,
+        *,
+        code: str,
+        analysis_date: date,
+        window_days: int,
+        fetcher_manager: DataFetcherManager,
+    ) -> Dict[str, Any]:
+        candidate_bars = self._load_forward_bars(
+            code=code,
+            analysis_date=analysis_date,
+            window_days=window_days,
+            fetcher_manager=fetcher_manager,
+        )
+        if len(candidate_bars) < window_days:
+            return {
+                "eval_status": "pending",
+                "entry_date": None,
+                "entry_price": None,
+                "exit_date": None,
+                "exit_price": None,
+                "benchmark_entry_price": None,
+                "benchmark_exit_price": None,
+                "return_pct": None,
+                "benchmark_return_pct": None,
+                "excess_return_pct": None,
+                "max_drawdown_pct": None,
+            }
+
+        entry_bar = candidate_bars[0]
+        exit_bar = candidate_bars[window_days - 1]
+        entry_price = _safe_float(getattr(entry_bar, "open", None))
+        exit_price = _safe_float(getattr(exit_bar, "close", None))
+        min_low = min(_safe_float(getattr(item, "low", None), entry_price) for item in candidate_bars[:window_days])
+        if entry_price <= 0 or exit_price <= 0:
+            return {
+                "eval_status": "invalid",
+                "entry_date": None,
+                "entry_price": None,
+                "exit_date": None,
+                "exit_price": None,
+                "benchmark_entry_price": None,
+                "benchmark_exit_price": None,
+                "return_pct": None,
+                "benchmark_return_pct": None,
+                "excess_return_pct": None,
+                "max_drawdown_pct": None,
+            }
+
+        return_pct = round((exit_price / entry_price - 1) * 100, 2)
+        max_drawdown_pct = round(max(0.0, (entry_price - min_low) / entry_price * 100), 2)
+
+        benchmark_bars = self._load_forward_bars(
+            code=DEFAULT_PICKER_BENCHMARK_CODE,
+            analysis_date=analysis_date,
+            window_days=window_days,
+            fetcher_manager=fetcher_manager,
+        )
+        benchmark_entry_price = None
+        benchmark_exit_price = None
+        benchmark_return_pct = None
+        excess_return_pct = None
+        if len(benchmark_bars) >= window_days:
+            benchmark_entry_price = _safe_float(getattr(benchmark_bars[0], "open", None))
+            benchmark_exit_price = _safe_float(getattr(benchmark_bars[window_days - 1], "close", None))
+            if benchmark_entry_price > 0 and benchmark_exit_price > 0:
+                benchmark_return_pct = round((benchmark_exit_price / benchmark_entry_price - 1) * 100, 2)
+                excess_return_pct = round(return_pct - benchmark_return_pct, 2)
+
+        return {
+            "eval_status": "completed",
+            "entry_date": getattr(entry_bar, "date", None),
+            "entry_price": round(entry_price, 3),
+            "exit_date": getattr(exit_bar, "date", None),
+            "exit_price": round(exit_price, 3),
+            "benchmark_entry_price": round(benchmark_entry_price, 3) if benchmark_entry_price else None,
+            "benchmark_exit_price": round(benchmark_exit_price, 3) if benchmark_exit_price else None,
+            "return_pct": return_pct,
+            "benchmark_return_pct": benchmark_return_pct,
+            "excess_return_pct": excess_return_pct,
+            "max_drawdown_pct": max_drawdown_pct,
+        }
+
+    def _load_forward_bars(
+        self,
+        *,
+        code: str,
+        analysis_date: date,
+        window_days: int,
+        fetcher_manager: DataFetcherManager,
+    ) -> List[Any]:
+        bars = self._stock_repo.get_forward_bars(
+            code=normalize_stock_code(code),
+            analysis_date=analysis_date,
+            eval_window_days=window_days,
+        )
+        if len(bars) >= window_days:
+            return bars
+
+        refresh_days = max(90, window_days * 8)
+        try:
+            df, source_name = fetcher_manager.get_daily_data(code, days=refresh_days)
+        except Exception as exc:
+            logger.debug("[StockPicker] refresh forward bars failed for %s: %s", code, exc)
+            return bars
+        if df is None or df.empty:
+            return bars
+        self._stock_repo.save_dataframe(df, normalize_stock_code(code), data_source=source_name)
+        return self._stock_repo.get_forward_bars(
+            code=normalize_stock_code(code),
+            analysis_date=analysis_date,
+            eval_window_days=window_days,
+        )
+
+    @staticmethod
+    def _build_task_notification_content(
+        *,
+        template_name: str,
+        mode: str,
+        sector_names: Sequence[str],
+        candidates: Sequence[Dict[str, Any]],
+    ) -> str:
+        lines = [
+            "# AI 选股摘要",
+            "",
+            f"- 模式：{'板块模式' if mode == 'sector' else '自选股模式'}",
+            f"- 模板：{template_name}",
+        ]
+        if mode == "sector" and sector_names:
+            lines.append(f"- 板块：{'、'.join(str(item) for item in sector_names[:5])}")
+        lines.append("")
+        lines.append("## Top 候选")
+        for candidate in list(candidates)[:5]:
+            lines.append(
+                f"- {candidate['rank']}. {candidate['name']} ({candidate['code']}) "
+                f"得分 {candidate['total_score']}：{candidate.get('explanation_summary') or '暂无摘要'}"
+            )
+        return "\n".join(lines)
+
+    def _send_task_notification(
+        self,
+        *,
+        task_id: str,
+        template_name: str,
+        mode: str,
+        sector_names: Sequence[str],
+        candidates: Sequence[Dict[str, Any]],
+    ) -> None:
+        notifier = NotificationService()
+        if not notifier.is_available():
+            logger.info("[StockPicker] skip notification for %s because no notification channel is configured", task_id)
+            return
+        content = self._build_task_notification_content(
+            template_name=template_name,
+            mode=mode,
+            sector_names=sector_names,
+            candidates=candidates,
+        )
+        try:
+            notifier.send(content)
+        except Exception as exc:
+            logger.warning("[StockPicker] notification failed for %s: %s", task_id, exc, exc_info=True)
 
     @staticmethod
     def _build_search_service() -> SearchService:
