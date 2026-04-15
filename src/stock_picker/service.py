@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import re
 import threading
@@ -8,7 +9,7 @@ import uuid
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import pandas as pd
@@ -26,7 +27,20 @@ from src.stock_picker.templates import get_template, list_templates
 logger = logging.getLogger(__name__)
 
 DEFAULT_PICKER_BENCHMARK_CODE = "000300"
+PICKER_POLICY_VERSION = "v3_phase2"
 PICKER_EVAL_WINDOWS = (5, 10, 20)
+PICKER_FALLBACK_RULES: Dict[str, Dict[str, float]] = {
+    "trend_breakout": {"min_total_score": 58.0, "min_trend_score": 20.0, "max_risk_penalty": 10.0},
+    "strong_pullback": {"min_total_score": 54.0, "min_trend_score": 16.0, "max_risk_penalty": 10.0},
+    "balanced": {"min_total_score": 52.0, "min_trend_score": 14.0, "max_risk_penalty": 12.0},
+}
+PICKER_SKIP_REASON_LABELS: Dict[str, str] = {
+    "daily_data_unavailable": "日线数据缺失",
+    "insufficient_history": "历史行情不足 20 个交易日",
+    "stale_trading_date": "最新行情日期落后于目标交易日",
+    "unsupported_template": "模板未命中受支持的评分逻辑",
+    "unknown": "未知原因",
+}
 
 _POSITIVE_NEWS_KEYWORDS = (
     "增持", "回购", "中标", "签约", "订单", "突破", "预增", "超预期", "新高",
@@ -121,6 +135,28 @@ def _normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
+def _frame_latest_day(frame: Optional[pd.DataFrame]) -> Optional[date]:
+    if frame is None or frame.empty or "date" not in frame.columns:
+        return None
+    latest = frame.iloc[-1]["date"]
+    if isinstance(latest, pd.Timestamp):
+        return latest.date()
+    if isinstance(latest, datetime):
+        return latest.date()
+    if hasattr(latest, "date"):
+        return latest.date()
+    return latest
+
+
+def _slice_frame_to_target_date(frame: Optional[pd.DataFrame], target_date: date) -> Optional[pd.DataFrame]:
+    if frame is None or frame.empty:
+        return frame
+    sliced = frame[frame["date"] <= pd.Timestamp(target_date)].copy()
+    if sliced.empty:
+        return sliced.reset_index(drop=True)
+    return sliced.sort_values("date").reset_index(drop=True)
+
+
 def _clean_json_block(text: str) -> Optional[Dict[str, Any]]:
     if not text:
         return None
@@ -142,6 +178,31 @@ def _truncate_text(value: Any, limit: int = 140) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _score_value(candidate: Dict[str, Any], score_name: str) -> float:
+    for item in candidate.get("score_breakdown") or []:
+        if item.get("score_name") == score_name:
+            return _safe_float(item.get("score_value"))
+    return 0.0
+
+
+def _normalize_sector_name(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    return re.sub(r"[\s\-_/\.\(\)（）\[\]【】·:：]+", "", text)
+
+
+def _sector_name_tokens(value: Any) -> List[str]:
+    normalized = _normalize_sector_name(value)
+    if not normalized:
+        return []
+    tokens = {normalized}
+    for suffix in ("板块", "行业", "概念"):
+        if normalized.endswith(suffix) and len(normalized) > len(suffix):
+            tokens.add(normalized[: -len(suffix)])
+    return [token for token in tokens if token]
 
 
 class StockPickerService:
@@ -173,6 +234,7 @@ class StockPickerService:
         self._futures_lock = threading.Lock()
         self._sector_cache_lock = threading.Lock()
         self._sector_catalog_cache: Optional[Dict[str, Any]] = None
+        self._sector_catalog_cache_key: Optional[str] = None
         recovered = self._repo.mark_incomplete_tasks_failed()
         if recovered:
             logger.info("[StockPicker] recovered %s incomplete task(s)", recovered)
@@ -218,11 +280,10 @@ class StockPickerService:
         if window_days not in PICKER_EVAL_WINDOWS:
             raise ValueError(f"window_days 必须为 {', '.join(str(item) for item in PICKER_EVAL_WINDOWS)} 之一。")
 
-        self._ensure_template_evaluations(window_days=window_days)
         rows = self._repo.list_evaluation_rows_for_window(window_days)
         grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         for row in rows:
-            if row["market"] != "cn" or row["eval_status"] != "completed":
+            if row["market"] != "cn" or row["eval_status"] not in {"completed", "benchmark_unavailable"}:
                 continue
             grouped[str(row["template_id"])].append(row)
 
@@ -237,6 +298,8 @@ class StockPickerService:
                         "template_name": template["name"],
                         "window_days": window_days,
                         "total_evaluations": 0,
+                        "comparable_evaluations": 0,
+                        "benchmark_unavailable_evaluations": 0,
                         "win_rate_pct": None,
                         "avg_return_pct": None,
                         "avg_excess_return_pct": None,
@@ -245,7 +308,12 @@ class StockPickerService:
                 )
                 continue
 
-            comparable_rows = [row for row in template_rows if row.get("excess_return_pct") is not None]
+            comparable_rows = [
+                row
+                for row in template_rows
+                if row.get("eval_status") == "completed" and row.get("excess_return_pct") is not None
+            ]
+            benchmark_unavailable_count = sum(1 for row in template_rows if row.get("eval_status") == "benchmark_unavailable")
             win_count = sum(1 for row in comparable_rows if float(row.get("excess_return_pct") or 0.0) > 0)
             avg_return = sum(float(row.get("return_pct") or 0.0) for row in template_rows) / total
             excess_rows = [float(row["excess_return_pct"]) for row in template_rows if row.get("excess_return_pct") is not None]
@@ -256,6 +324,8 @@ class StockPickerService:
                     "template_name": template["name"],
                     "window_days": window_days,
                     "total_evaluations": total,
+                    "comparable_evaluations": len(comparable_rows),
+                    "benchmark_unavailable_evaluations": benchmark_unavailable_count,
                     "win_rate_pct": round(win_count / len(comparable_rows) * 100, 2) if comparable_rows else None,
                     "avg_return_pct": round(avg_return, 2),
                     "avg_excess_return_pct": round(sum(excess_rows) / len(excess_rows), 2) if excess_rows else None,
@@ -296,8 +366,8 @@ class StockPickerService:
         if task_limit < 1 or task_limit > 30:
             raise ValueError("limit 必须介于 1 和 30 之间。")
         task_ai_top_k = int(ai_top_k or 5)
-        if task_ai_top_k < 1 or task_ai_top_k > 8:
-            raise ValueError("ai_top_k 必须介于 1 和 8 之间。")
+        if task_ai_top_k < 1 or task_ai_top_k > 10:
+            raise ValueError("ai_top_k 必须介于 1 和 10 之间。")
         if task_ai_top_k > task_limit:
             raise ValueError("ai_top_k 不能大于 limit。")
 
@@ -317,10 +387,23 @@ class StockPickerService:
                 raise ValueError(f"存在无效板块：{', '.join(missing)}")
             selected_sector_names = [str(available_by_id[item]["name"]) for item in selected_sector_ids]
 
+        sector_catalog_request = {}
+        if task_mode == "sector":
+            sector_catalog_request = self._build_sector_catalog_snapshot(
+                catalog=catalog,
+                selected_sector_names=selected_sector_names,
+                selected_stock_codes=[
+                    code
+                    for sector_name in selected_sector_names
+                    for code in catalog.get("code_by_sector", {}).get(sector_name, [])
+                ],
+            )
+
         task_id = uuid.uuid4().hex
         self._repo.create_task(
             task_id=task_id,
             template_id=template_id,
+            template_version=PICKER_POLICY_VERSION,
             universe_id=universe_id,
             limit=task_limit,
             ai_top_k=task_ai_top_k,
@@ -335,6 +418,9 @@ class StockPickerService:
                 "sector_names": selected_sector_names,
                 "force_refresh": bool(force_refresh),
                 "notify": bool(notify),
+                "benchmark_policy": self._build_benchmark_policy(),
+                "sector_catalog_request": sector_catalog_request,
+                "request_policy_version": PICKER_POLICY_VERSION,
                 "template_overrides": {},
             },
         )
@@ -352,13 +438,174 @@ class StockPickerService:
         payload = self._repo.get_task(task_id, include_candidates=True)
         if payload is None:
             return None
-        if payload.get("status") == "completed":
-            try:
-                self._ensure_task_evaluations(task_id)
-                payload = self._repo.get_task(task_id, include_candidates=True) or payload
-            except Exception as exc:
-                logger.warning("[StockPicker] refresh evaluations failed for %s: %s", task_id, exc, exc_info=True)
         return self._decorate_task(payload)
+
+    def replay_historical_run(
+        self,
+        *,
+        target_date: date,
+        template_id: str,
+        mode: str = "watchlist",
+        sector_ids: Optional[Sequence[str]] = None,
+        limit: int = 20,
+        force_refresh: bool = False,
+        window_days: Optional[Sequence[int]] = None,
+        sector_ranking_mode: str = "neutral",
+        benchmark_mode: str = "local_only",
+    ) -> Dict[str, Any]:
+        """Run a validation-only historical replay without writing picker tasks."""
+        template = get_template(template_id)
+        task_mode = str(mode or "watchlist").strip().lower()
+        if task_mode not in {"watchlist", "sector"}:
+            raise ValueError("mode 仅支持 watchlist 或 sector。")
+        if sector_ranking_mode not in {"neutral", "live"}:
+            raise ValueError("sector_ranking_mode 仅支持 neutral 或 live。")
+        if benchmark_mode not in {"local_only", "fetch_missing"}:
+            raise ValueError("benchmark_mode 仅支持 local_only 或 fetch_missing。")
+
+        replay_limit = int(limit or 20)
+        if replay_limit < 1 or replay_limit > 30:
+            raise ValueError("limit 必须介于 1 和 30 之间。")
+
+        windows = [int(item) for item in (window_days or PICKER_EVAL_WINDOWS)]
+        invalid_windows = [item for item in windows if item not in PICKER_EVAL_WINDOWS]
+        if invalid_windows:
+            raise ValueError(f"window_days 必须为 {', '.join(str(item) for item in PICKER_EVAL_WINDOWS)} 之一。")
+
+        stock_codes, selected_sector_names = self._resolve_task_stock_codes(
+            task_mode=task_mode,
+            universe_id="sector" if task_mode == "sector" else "watchlist",
+            sector_ids=sector_ids or [],
+        )
+        if task_mode == "sector" and not selected_sector_names:
+            raise ValueError("板块模式至少需要选择 1 个有效板块。")
+
+        fetcher_manager = DataFetcherManager()
+        if sector_ranking_mode == "live":
+            top_sectors, bottom_sectors = self._load_sector_rankings(fetcher_manager)
+        else:
+            top_sectors, bottom_sectors = [], []
+
+        scored_candidates: List[Dict[str, Any]] = []
+        insufficient_count = 0
+        insufficient_reason_breakdown: Dict[str, int] = defaultdict(int)
+        error_count = 0
+        target_dates_by_market: Dict[str, str] = {}
+
+        for code in stock_codes:
+            try:
+                effective_target_date = self._resolve_effective_target_trading_date(
+                    code=code,
+                    target_date=target_date,
+                )
+                target_dates_by_market[self._detect_market(code)] = effective_target_date.isoformat()
+                candidate = self._evaluate_candidate_for_target_date(
+                    code=code,
+                    template_id=template.template_id,
+                    fetcher_manager=fetcher_manager,
+                    force_refresh=bool(force_refresh),
+                    top_sectors=top_sectors,
+                    bottom_sectors=bottom_sectors,
+                    target_date=effective_target_date,
+                )
+                if candidate is None:
+                    insufficient_count += 1
+                    insufficient_reason_breakdown["unknown"] += 1
+                elif candidate.get("candidate_state") == "skipped":
+                    insufficient_count += 1
+                    skip_reason = str(candidate.get("skip_reason") or "unknown")
+                    insufficient_reason_breakdown[skip_reason] += 1
+                else:
+                    scored_candidates.append(candidate)
+            except Exception as exc:
+                error_count += 1
+                logger.warning("[StockPicker] historical replay evaluate %s failed: %s", code, exc, exc_info=True)
+
+        ranked_candidates = self._rank_candidates(scored_candidates)
+        selected_candidates = self._select_candidates(ranked_candidates, limit=replay_limit)
+        evaluation_summary: Dict[int, Dict[str, int]] = {
+            int(item): {
+                "candidate_count": len(selected_candidates),
+                "completed": 0,
+                "pending": 0,
+                "benchmark_unavailable": 0,
+                "invalid": 0,
+            }
+            for item in windows
+        }
+
+        for candidate in selected_candidates:
+            structured = self._build_structured_explanation(template.name, candidate)
+            candidate["explanation_summary"] = structured["summary"]
+            candidate["explanation_rationale"] = structured["rationale"]
+            candidate["explanation_risks"] = structured["risks"]
+            candidate["explanation_watchpoints"] = structured["watchpoints"]
+            candidate["technical_snapshot"]["explanation_source"] = "structured_replay"
+            candidate_evaluations = []
+            for current_window in windows:
+                payload = self._evaluate_candidate_window(
+                    code=str(candidate["code"]),
+                    analysis_date=candidate["latest_date"],
+                    window_days=current_window,
+                    fetcher_manager=fetcher_manager,
+                    refresh_missing_data=(benchmark_mode == "fetch_missing"),
+                )
+                evaluation_summary[int(current_window)][str(payload["eval_status"])] += 1
+                candidate_evaluations.append(
+                    {
+                        "window_days": int(current_window),
+                        "benchmark_code": DEFAULT_PICKER_BENCHMARK_CODE,
+                        **payload,
+                    }
+                )
+            candidate["evaluations"] = candidate_evaluations
+
+        summary = {
+            "template_id": template.template_id,
+            "template_name": template.name,
+            "mode": task_mode,
+            "sector_names": selected_sector_names,
+            "total_stocks": len(stock_codes),
+            "scored_count": len(scored_candidates),
+            "insufficient_count": insufficient_count,
+            "error_count": error_count,
+            "strict_match_count": sum(1 for item in ranked_candidates if item["strict_match"]),
+            "selected_count": len(selected_candidates),
+            "qualified_fallback_count": sum(1 for item in ranked_candidates if item.get("fallback_eligible")),
+            "fallback_count": sum(1 for item in selected_candidates if item["selection_reason"] == "fallback_fill"),
+            "explained_count": len(selected_candidates),
+            "insufficient_reason_breakdown": dict(sorted(insufficient_reason_breakdown.items())),
+            "insufficient_reason_labels": deepcopy(PICKER_SKIP_REASON_LABELS),
+            "benchmark_policy": self._build_benchmark_policy(),
+            "selection_quality_gate": {
+                "fallback_rules": deepcopy(PICKER_FALLBACK_RULES),
+                "selection_policy": "strict_match_first_then_quality_gated_fallback",
+            },
+            "replay_policy": {
+                "mode": "historical_validation_replay",
+                "target_date": target_date.isoformat(),
+                "market_target_dates": dict(sorted(target_dates_by_market.items())),
+                "sector_ranking_mode": sector_ranking_mode,
+                "benchmark_mode": benchmark_mode,
+                "news_mode": "disabled",
+                "ai_mode": "disabled",
+                "membership_snapshot": "current_sector_catalog",
+            },
+            "evaluation_summary": evaluation_summary,
+        }
+        return {
+            "target_date": target_date.isoformat(),
+            "template_id": template.template_id,
+            "template_name": template.name,
+            "mode": task_mode,
+            "sector_names": selected_sector_names,
+            "sector_ranking_mode": sector_ranking_mode,
+            "benchmark_mode": benchmark_mode,
+            "benchmark_code": DEFAULT_PICKER_BENCHMARK_CODE,
+            "window_days": windows,
+            "summary": summary,
+            "candidates": selected_candidates,
+        }
 
     def _decorate_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         task = deepcopy(payload)
@@ -383,7 +630,67 @@ class StockPickerService:
             "completed": "已完成",
             "failed": "失败",
         }.get(task["status"], task["status"])
+        task["summary"] = self._build_task_summary_defaults(
+            task=task,
+            template_name=template.name,
+        )
         return task
+
+    def _build_task_summary_defaults(
+        self,
+        *,
+        task: Dict[str, Any],
+        template_name: str,
+    ) -> Dict[str, Any]:
+        request_payload = task.get("request_payload") or {}
+        task_mode = str(task.get("mode") or request_payload.get("mode") or "watchlist")
+        summary = deepcopy(task.get("summary") or {})
+        if task_mode == "sector" and task.get("sector_names") and not summary.get("sector_quality_summary"):
+            try:
+                sector_quality_summary, ranked_sector_breakdown = self._build_sector_quality_summary(
+                    self._load_sector_catalog(),
+                    task.get("sector_names") or [],
+                )
+            except Exception:
+                sector_quality_summary, ranked_sector_breakdown = {}, []
+        else:
+            sector_quality_summary = summary.get("sector_quality_summary") or {}
+            ranked_sector_breakdown = summary.get("ranked_sector_breakdown") or []
+
+        fallback_summary = {
+            "template_id": task.get("template_id"),
+            "template_name": template_name,
+            "universe_id": task.get("universe_id"),
+            "mode": task_mode,
+            "total_stocks": int(task.get("total_stocks") or 0),
+            "scored_count": int(summary.get("scored_count") or task.get("processed_stocks") or 0),
+            "insufficient_count": int(summary.get("insufficient_count") or 0),
+            "error_count": int(summary.get("error_count") or 0),
+            "strict_match_count": int(summary.get("strict_match_count") or 0),
+            "selected_count": int(summary.get("selected_count") or task.get("candidate_count") or 0),
+            "qualified_fallback_count": int(summary.get("qualified_fallback_count") or 0),
+            "fallback_count": int(summary.get("fallback_count") or 0),
+            "explained_count": int(summary.get("explained_count") or 0),
+            "insufficient_reason_breakdown": deepcopy(summary.get("insufficient_reason_breakdown") or {}),
+            "insufficient_reason_labels": deepcopy(summary.get("insufficient_reason_labels") or PICKER_SKIP_REASON_LABELS),
+            "trading_date_policy": deepcopy(summary.get("trading_date_policy") or {}),
+            "sector_catalog_snapshot": deepcopy(
+                summary.get("sector_catalog_snapshot") or request_payload.get("sector_catalog_request") or {}
+            ),
+            "sector_quality_summary": deepcopy(sector_quality_summary),
+            "ranked_sector_breakdown": deepcopy(ranked_sector_breakdown),
+            "benchmark_policy": deepcopy(
+                summary.get("benchmark_policy") or request_payload.get("benchmark_policy") or self._build_benchmark_policy()
+            ),
+            "selection_quality_gate": deepcopy(
+                summary.get("selection_quality_gate")
+                or {
+                    "fallback_rules": deepcopy(PICKER_FALLBACK_RULES),
+                    "selection_policy": "strict_match_first_then_quality_gated_fallback",
+                }
+            ),
+        }
+        return fallback_summary
 
     def _resolve_task_stock_codes(
         self,
@@ -408,6 +715,240 @@ class StockPickerService:
             logger.warning("[StockPicker] unexpected universe %s for watchlist mode", universe_id)
         return stock_codes, []
 
+    @staticmethod
+    def _build_skip_result(
+        code: str,
+        reason_code: str,
+        *,
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "candidate_state": "skipped",
+            "code": canonical_stock_code(code),
+            "skip_reason": reason_code,
+            "skip_detail": detail or {},
+        }
+
+    @staticmethod
+    def _build_benchmark_policy() -> Dict[str, Any]:
+        return {
+            "benchmark_code": DEFAULT_PICKER_BENCHMARK_CODE,
+            "benchmark_market": "cn",
+            "comparability_rule": "same_window_benchmark_return_required",
+            "benchmark_unavailable_status": "benchmark_unavailable",
+        }
+
+    @staticmethod
+    def _build_task_trading_date_policy(
+        stock_codes: Sequence[str],
+        *,
+        reference_time: datetime,
+    ) -> Dict[str, Any]:
+        markets = sorted({StockPickerService._detect_market(code) for code in stock_codes}) or ["cn"]
+        return {
+            "policy": "market_effective_trading_date",
+            "reference_time": reference_time.isoformat(),
+            "market_target_dates": {
+                market: get_effective_trading_date(market, current_time=reference_time).isoformat()
+                for market in markets
+            },
+        }
+
+    @staticmethod
+    def _build_sector_catalog_snapshot(
+        *,
+        catalog: Dict[str, Any],
+        selected_sector_names: Sequence[str],
+        selected_stock_codes: Sequence[str],
+    ) -> Dict[str, Any]:
+        return {
+            "catalog_policy": str(catalog.get("catalog_policy") or "dynamic_a_share_industry_from_stock_list"),
+            "source_name": catalog.get("source_name"),
+            "catalog_signature": str(catalog.get("catalog_signature") or "empty"),
+            "sector_count": int(catalog.get("sector_count") or len(catalog.get("items") or [])),
+            "catalog_stock_count": int(catalog.get("stock_count") or 0),
+            "selected_sector_count": len(list(selected_sector_names)),
+            "selected_sector_names": [str(item) for item in selected_sector_names],
+            "selected_stock_count": len(_dedupe_codes(selected_stock_codes)),
+        }
+
+    @staticmethod
+    def _build_sector_quality_index(
+        top_sectors: Sequence[Dict[str, Any]],
+        bottom_sectors: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        quality_index: Dict[str, Dict[str, Any]] = {}
+
+        def register(
+            sector_name: Any,
+            *,
+            rank_direction: str,
+            rank_position: int,
+            change_pct: Optional[float],
+        ) -> None:
+            name = str(sector_name or "").strip()
+            if not name:
+                return
+            payload = {
+                "name": name,
+                "strength_label": "强势" if rank_direction == "top" else "弱势",
+                "rank_direction": rank_direction,
+                "rank_position": rank_position,
+                "change_pct": round(_safe_float(change_pct), 2) if change_pct is not None else None,
+                "is_ranked_today": True,
+                "strength_priority": 2 if rank_direction == "top" else 0,
+            }
+            for token in _sector_name_tokens(name):
+                existing = quality_index.get(token)
+                if existing is None or int(payload["rank_position"]) < int(existing.get("rank_position") or 999):
+                    quality_index[token] = payload
+
+        for index, item in enumerate(top_sectors[:10], start=1):
+            register(
+                item.get("name"),
+                rank_direction="top",
+                rank_position=index,
+                change_pct=_safe_float(item.get("change_pct")) if item.get("change_pct") is not None else None,
+            )
+        for index, item in enumerate(bottom_sectors[:10], start=1):
+            register(
+                item.get("name"),
+                rank_direction="bottom",
+                rank_position=index,
+                change_pct=_safe_float(item.get("change_pct")) if item.get("change_pct") is not None else None,
+            )
+        return quality_index
+
+    @staticmethod
+    def _resolve_sector_quality(
+        sector_name: Any,
+        quality_index: Mapping[str, Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        normalized = _normalize_sector_name(sector_name)
+        tokens = _sector_name_tokens(sector_name)
+        for token in [normalized, *tokens]:
+            if not token:
+                continue
+            payload = quality_index.get(token)
+            if payload:
+                return {
+                    "strength_label": payload.get("strength_label"),
+                    "rank_direction": payload.get("rank_direction"),
+                    "rank_position": payload.get("rank_position"),
+                    "change_pct": payload.get("change_pct"),
+                    "is_ranked_today": bool(payload.get("is_ranked_today")),
+                    "strength_priority": int(payload.get("strength_priority") or 1),
+                    "matched_ranking_name": payload.get("name"),
+                }
+
+        return {
+            "strength_label": "中性",
+            "rank_direction": None,
+            "rank_position": None,
+            "change_pct": None,
+            "is_ranked_today": False,
+            "strength_priority": 1,
+            "matched_ranking_name": None,
+        }
+
+    @staticmethod
+    def _build_sector_quality_summary(
+        catalog: Dict[str, Any],
+        selected_sector_names: Sequence[str],
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        catalog_items = {
+            str(item.get("name") or ""): item
+            for item in catalog.get("items") or []
+        }
+        ranked_breakdown: List[Dict[str, Any]] = []
+        summary = {
+            "selected_sector_count": len(list(selected_sector_names)),
+            "ranked_count": 0,
+            "strong_count": 0,
+            "neutral_count": 0,
+            "weak_count": 0,
+            "top_ranked_count": 0,
+            "bottom_ranked_count": 0,
+            "avg_ranked_change_pct": None,
+        }
+
+        ranked_changes: List[float] = []
+        for sector_name in selected_sector_names:
+            item = catalog_items.get(str(sector_name))
+            if not item:
+                continue
+            strength_label = str(item.get("strength_label") or "中性")
+            if strength_label == "强势":
+                summary["strong_count"] += 1
+            elif strength_label == "弱势":
+                summary["weak_count"] += 1
+            else:
+                summary["neutral_count"] += 1
+
+            if item.get("rank_direction") == "top":
+                summary["top_ranked_count"] += 1
+            elif item.get("rank_direction") == "bottom":
+                summary["bottom_ranked_count"] += 1
+
+            if item.get("is_ranked_today"):
+                summary["ranked_count"] += 1
+                change_pct = item.get("change_pct")
+                if change_pct is not None:
+                    ranked_changes.append(float(change_pct))
+                ranked_breakdown.append(
+                    {
+                        "sector_id": item.get("sector_id"),
+                        "name": item.get("name"),
+                        "strength_label": strength_label,
+                        "rank_direction": item.get("rank_direction"),
+                        "rank_position": item.get("rank_position"),
+                        "change_pct": item.get("change_pct"),
+                        "stock_count": item.get("stock_count"),
+                    }
+                )
+
+        if ranked_changes:
+            summary["avg_ranked_change_pct"] = round(sum(ranked_changes) / len(ranked_changes), 2)
+
+        ranked_breakdown.sort(
+            key=lambda item: (
+                0 if item.get("rank_direction") == "top" else 1,
+                int(item.get("rank_position") or 999),
+                str(item.get("name") or ""),
+            )
+        )
+        return summary, ranked_breakdown
+
+    @staticmethod
+    def _match_sector_name(board_names: Sequence[str], sector_name: Any) -> Optional[Dict[str, Any]]:
+        sector_display_name = str(sector_name or "").strip()
+        sector_normalized = _normalize_sector_name(sector_display_name)
+        sector_tokens = set(_sector_name_tokens(sector_display_name))
+        if not sector_normalized:
+            return None
+
+        for board_name in board_names:
+            board_display_name = str(board_name or "").strip()
+            board_normalized = _normalize_sector_name(board_display_name)
+            if board_normalized and board_normalized == sector_normalized:
+                return {"matched_board": board_display_name, "match_type": "exact"}
+
+        for board_name in board_names:
+            board_display_name = str(board_name or "").strip()
+            board_tokens = set(_sector_name_tokens(board_display_name))
+            if sector_tokens & board_tokens:
+                return {"matched_board": board_display_name, "match_type": "token"}
+
+        for board_name in board_names:
+            board_display_name = str(board_name or "").strip()
+            board_normalized = _normalize_sector_name(board_display_name)
+            if not board_normalized:
+                continue
+            if sector_normalized in board_normalized or board_normalized in sector_normalized:
+                return {"matched_board": board_display_name, "match_type": "fuzzy"}
+
+        return None
+
     def _run_task(self, task_id: str) -> None:
         try:
             task = self._repo.get_task(task_id, include_candidates=False)
@@ -415,6 +956,7 @@ class StockPickerService:
                 return
 
             template = get_template(task["template_id"])
+            config = get_config()
             request_payload = task.get("request_payload") or {}
             task_mode = str(request_payload.get("mode") or ("sector" if task["universe_id"] == "sector" else "watchlist"))
             stock_codes, selected_sector_names = self._resolve_task_stock_codes(
@@ -422,6 +964,24 @@ class StockPickerService:
                 universe_id=task["universe_id"],
                 sector_ids=request_payload.get("sector_ids") or [],
             )
+            reference_time = datetime.now()
+            trading_date_policy = self._build_task_trading_date_policy(
+                stock_codes,
+                reference_time=reference_time,
+            )
+            sector_catalog_snapshot = self._build_sector_catalog_snapshot(
+                catalog=self._load_sector_catalog(),
+                selected_sector_names=selected_sector_names,
+                selected_stock_codes=stock_codes,
+            )
+            sector_quality_summary: Dict[str, Any] = {}
+            ranked_sector_breakdown: List[Dict[str, Any]] = []
+            if task_mode == "sector" and selected_sector_names:
+                sector_quality_summary, ranked_sector_breakdown = self._build_sector_quality_summary(
+                    self._load_sector_catalog(),
+                    selected_sector_names,
+                )
+            benchmark_policy = self._build_benchmark_policy()
             self._repo.start_task(task_id, total_stocks=len(stock_codes))
 
             if not stock_codes:
@@ -431,11 +991,11 @@ class StockPickerService:
             fetcher_manager = DataFetcherManager()
             search_service = self._build_search_service()
             analyzer = GeminiAnalyzer(config=config)
-            reference_time = datetime.now()
 
             top_sectors, bottom_sectors = self._load_sector_rankings(fetcher_manager)
             scored_candidates: List[Dict[str, Any]] = []
             insufficient_count = 0
+            insufficient_reason_breakdown: Dict[str, int] = defaultdict(int)
             error_count = 0
 
             for index, code in enumerate(stock_codes, start=1):
@@ -451,6 +1011,11 @@ class StockPickerService:
                     )
                     if candidate is None:
                         insufficient_count += 1
+                        insufficient_reason_breakdown["unknown"] += 1
+                    elif candidate.get("candidate_state") == "skipped":
+                        insufficient_count += 1
+                        skip_reason = str(candidate.get("skip_reason") or "unknown")
+                        insufficient_reason_breakdown[skip_reason] += 1
                     else:
                         scored_candidates.append(candidate)
                 except Exception as exc:
@@ -493,17 +1058,14 @@ class StockPickerService:
                     processed_stocks=len(stock_codes),
                 )
 
-            ranked_candidates = sorted(
-                scored_candidates,
-                key=lambda item: (
-                    item["total_score"],
-                    item["trend_score"],
-                    item["setup_score"],
-                    item["volume_score"],
-                ),
-                reverse=True,
-            )
+            ranked_candidates = self._rank_candidates(scored_candidates)
             selected_candidates = self._select_candidates(ranked_candidates, limit=task["limit"])
+            if not selected_candidates:
+                self._repo.fail_task(
+                    task_id,
+                    error_message="没有筛出满足质量门槛的候选，建议放宽股票池或切换模板。",
+                )
+                return
             self._repo.update_progress(
                 task_id,
                 progress_percent=86,
@@ -513,23 +1075,26 @@ class StockPickerService:
 
             explain_count = min(task["ai_top_k"], len(selected_candidates))
             for index, candidate in enumerate(selected_candidates, start=1):
-                fallback = self._build_fallback_explanation(template.name, candidate)
-                candidate["explanation_summary"] = fallback["summary"]
-                candidate["explanation_rationale"] = fallback["rationale"]
-                candidate["explanation_risks"] = fallback["risks"]
-                candidate["explanation_watchpoints"] = fallback["watchpoints"]
+                structured = self._build_structured_explanation(template.name, candidate)
+                candidate["explanation_summary"] = structured["summary"]
+                candidate["explanation_rationale"] = structured["rationale"]
+                candidate["explanation_risks"] = structured["risks"]
+                candidate["explanation_watchpoints"] = structured["watchpoints"]
+                candidate["technical_snapshot"]["explanation_source"] = "structured"
 
                 if index <= explain_count:
                     ai_payload = self._build_ai_explanation(
                         analyzer=analyzer,
                         template_name=template.name,
                         candidate=candidate,
+                        base_explanation=structured,
                     )
                     if ai_payload:
                         candidate["explanation_summary"] = ai_payload["summary"]
                         candidate["explanation_rationale"] = ai_payload["rationale"]
                         candidate["explanation_risks"] = ai_payload["risks"]
                         candidate["explanation_watchpoints"] = ai_payload["watchpoints"]
+                        candidate["technical_snapshot"]["explanation_source"] = "structured_plus_ai_summary"
 
                 progress = 88 + int(index / max(len(selected_candidates), 1) * 10)
                 self._repo.update_progress(
@@ -551,8 +1116,20 @@ class StockPickerService:
                 "error_count": error_count,
                 "strict_match_count": sum(1 for item in ranked_candidates if item["strict_match"]),
                 "selected_count": len(selected_candidates),
+                "qualified_fallback_count": sum(1 for item in ranked_candidates if item.get("fallback_eligible")),
                 "fallback_count": sum(1 for item in selected_candidates if item["selection_reason"] == "fallback_fill"),
                 "explained_count": explain_count,
+                "insufficient_reason_breakdown": dict(sorted(insufficient_reason_breakdown.items())),
+                "insufficient_reason_labels": deepcopy(PICKER_SKIP_REASON_LABELS),
+                "trading_date_policy": trading_date_policy,
+                "sector_catalog_snapshot": sector_catalog_snapshot,
+                "sector_quality_summary": sector_quality_summary,
+                "ranked_sector_breakdown": ranked_sector_breakdown,
+                "benchmark_policy": benchmark_policy,
+                "selection_quality_gate": {
+                    "fallback_rules": deepcopy(PICKER_FALLBACK_RULES),
+                    "selection_policy": "strict_match_first_then_quality_gated_fallback",
+                },
             }
             self._repo.save_candidates(task_id, summary=summary, candidates=selected_candidates)
             self._ensure_task_evaluations(task_id)
@@ -589,8 +1166,14 @@ class StockPickerService:
             force_refresh=force_refresh,
             current_time=current_time,
         )
-        if daily_frame is None or len(daily_frame) < 20:
-            return None
+        if daily_frame is None:
+            return self._build_skip_result(code, "daily_data_unavailable")
+        if len(daily_frame) < 20:
+            return self._build_skip_result(
+                code,
+                "insufficient_history",
+                detail={"available_rows": int(len(daily_frame))},
+            )
 
         last_row = daily_frame.iloc[-1]
         latest_date = last_row["date"].date() if hasattr(last_row["date"], "date") else last_row["date"]
@@ -600,7 +1183,85 @@ class StockPickerService:
             latest_date = latest_date.date()
         target_date = self._resolve_target_trading_date(normalized_code, current_time=current_time)
         if isinstance(latest_date, date) and latest_date < target_date:
-            return None
+            return self._build_skip_result(
+                code,
+                "stale_trading_date",
+                detail={
+                    "latest_date": latest_date.isoformat(),
+                    "target_trading_date": target_date.isoformat(),
+                },
+            )
+
+        return self._build_candidate_from_frame(
+            code=code,
+            template_id=template_id,
+            daily_frame=daily_frame,
+            fetcher_manager=fetcher_manager,
+            top_sectors=top_sectors,
+            bottom_sectors=bottom_sectors,
+            target_date=target_date,
+        )
+
+    def _evaluate_candidate_for_target_date(
+        self,
+        *,
+        code: str,
+        template_id: str,
+        fetcher_manager: DataFetcherManager,
+        force_refresh: bool,
+        top_sectors: List[Dict[str, Any]],
+        bottom_sectors: List[Dict[str, Any]],
+        target_date: date,
+    ) -> Optional[Dict[str, Any]]:
+        normalized_code = normalize_stock_code(code)
+        daily_frame = self._load_daily_frame_for_target_date(
+            code=normalized_code,
+            target_date=target_date,
+            fetcher_manager=fetcher_manager,
+            force_refresh=force_refresh,
+        )
+        if daily_frame is None:
+            return self._build_skip_result(code, "daily_data_unavailable")
+        if len(daily_frame) < 20:
+            return self._build_skip_result(
+                code,
+                "insufficient_history",
+                detail={"available_rows": int(len(daily_frame))},
+            )
+
+        latest_date = _frame_latest_day(daily_frame)
+        if isinstance(latest_date, date) and latest_date < target_date:
+            return self._build_skip_result(
+                code,
+                "stale_trading_date",
+                detail={
+                    "latest_date": latest_date.isoformat(),
+                    "target_trading_date": target_date.isoformat(),
+                },
+            )
+
+        return self._build_candidate_from_frame(
+            code=code,
+            template_id=template_id,
+            daily_frame=daily_frame,
+            fetcher_manager=fetcher_manager,
+            top_sectors=top_sectors,
+            bottom_sectors=bottom_sectors,
+            target_date=target_date,
+        )
+
+    def _build_candidate_from_frame(
+        self,
+        *,
+        code: str,
+        template_id: str,
+        daily_frame: pd.DataFrame,
+        fetcher_manager: DataFetcherManager,
+        top_sectors: List[Dict[str, Any]],
+        bottom_sectors: List[Dict[str, Any]],
+        target_date: date,
+    ) -> Optional[Dict[str, Any]]:
+        latest_date = _frame_latest_day(daily_frame)
 
         name = fetcher_manager.get_stock_name(code, allow_realtime=False) or code
         market = self._detect_market(code)
@@ -621,7 +1282,11 @@ class StockPickerService:
             bottom_sectors=bottom_sectors,
         )
         if scoring is None:
-            return None
+            return self._build_skip_result(
+                code,
+                "unsupported_template",
+                detail={"template_id": template_id},
+            )
 
         candidate = {
             "rank": 0,
@@ -645,13 +1310,27 @@ class StockPickerService:
             "board_names": board_names,
             "news_briefs": [],
             "score_breakdown": [
-                {"score_name": "trend_score", "score_label": "趋势结构", "score_value": scoring["trend_score"], "detail": {}},
-                {"score_name": "setup_score", "score_label": "模板匹配", "score_value": scoring["setup_score"], "detail": {}},
-                {"score_name": "volume_score", "score_label": "量能配合", "score_value": scoring["volume_score"], "detail": {}},
-                {"score_name": "sector_score", "score_label": "板块强度", "score_value": scoring["sector_score"], "detail": {}},
+                {"score_name": "trend_score", "score_label": "趋势结构", "score_value": scoring["trend_score"], "detail": deepcopy(scoring["trend_detail"])},
+                {"score_name": "setup_score", "score_label": "模板匹配", "score_value": scoring["setup_score"], "detail": deepcopy(scoring["setup_detail"])},
+                {"score_name": "volume_score", "score_label": "量能配合", "score_value": scoring["volume_score"], "detail": deepcopy(scoring["volume_detail"])},
+                {"score_name": "sector_score", "score_label": "板块强度", "score_value": scoring["sector_score"], "detail": deepcopy(scoring["sector_detail"])},
                 {"score_name": "news_score", "score_label": "新闻情绪", "score_value": 0.0, "detail": {}},
-                {"score_name": "risk_penalty", "score_label": "风险扣分", "score_value": -scoring["risk_penalty"], "detail": {}},
-                {"score_name": "total_score", "score_label": "综合得分", "score_value": scoring["total_score"], "detail": {}},
+                {"score_name": "risk_penalty", "score_label": "风险扣分", "score_value": -scoring["risk_penalty"], "detail": deepcopy(scoring["risk_detail"])},
+                {
+                    "score_name": "total_score",
+                    "score_label": "综合得分",
+                    "score_value": scoring["total_score"],
+                    "detail": {
+                        "selection_context": deepcopy(scoring["selection_context"]),
+                        "component_scores": {
+                            "trend_score": scoring["trend_score"],
+                            "setup_score": scoring["setup_score"],
+                            "volume_score": scoring["volume_score"],
+                            "sector_score": scoring["sector_score"],
+                            "risk_penalty": scoring["risk_penalty"],
+                        },
+                    },
+                },
             ],
             "technical_snapshot": {
                 "ma5": round(metrics["ma5"], 3),
@@ -663,7 +1342,11 @@ class StockPickerService:
                 "pullback_from_high_pct": round(metrics["pullback_from_high_pct"], 2),
                 "latest_pct_chg": round(metrics["latest_pct_chg"], 2),
                 "ma20_slope_pct": round(metrics["ma20_slope_pct"], 2),
+                "target_trading_date": target_date.isoformat(),
+                "selection_context": deepcopy(scoring["selection_context"]),
+                "explanation_source": "structured",
             },
+            "fallback_eligible": scoring["selection_context"]["fallback_eligible"],
         }
         return candidate
 
@@ -693,12 +1376,51 @@ class StockPickerService:
         self._stock_repo.save_dataframe(df, code, data_source=source_name)
         return _normalize_dataframe(df)
 
+    def _load_daily_frame_for_target_date(
+        self,
+        *,
+        code: str,
+        target_date: date,
+        fetcher_manager: DataFetcherManager,
+        force_refresh: bool,
+    ) -> Optional[pd.DataFrame]:
+        history_days = 240
+        range_start = target_date - timedelta(days=history_days * 2)
+        cached_rows = self._stock_repo.get_range(
+            normalize_stock_code(code),
+            start_date=range_start,
+            end_date=target_date,
+        )
+        cached_frame = _normalize_dataframe(_rows_to_dataframe(cached_rows)) if cached_rows else None
+        cached_latest = _frame_latest_day(cached_frame)
+        if not force_refresh and cached_frame is not None and len(cached_frame) >= 30:
+            if isinstance(cached_latest, date) and cached_latest >= target_date:
+                return _slice_frame_to_target_date(cached_frame, target_date)
+
+        try:
+            df, source_name = fetcher_manager.get_daily_data(code, days=history_days)
+        except Exception as exc:
+            logger.debug("[StockPicker] load historical daily frame failed for %s: %s", code, exc)
+            return cached_frame
+        if df is None or df.empty:
+            return cached_frame
+        self._stock_repo.save_dataframe(df, normalize_stock_code(code), data_source=source_name)
+        normalized = _normalize_dataframe(df)
+        return _slice_frame_to_target_date(normalized, target_date)
+
     @staticmethod
     def _resolve_target_trading_date(
         code: str, current_time: Optional[datetime] = None
     ) -> date:
         market = get_market_for_stock(normalize_stock_code(code))
         return get_effective_trading_date(market, current_time=current_time)
+
+    @staticmethod
+    def _resolve_effective_target_trading_date(code: str, target_date: date) -> date:
+        return StockPickerService._resolve_target_trading_date(
+            code,
+            current_time=datetime.combine(target_date, time(15, 0)),
+        )
 
     @staticmethod
     def _build_metrics(daily_frame: pd.DataFrame) -> Dict[str, float]:
@@ -754,42 +1476,85 @@ class StockPickerService:
         ma10 = metrics["ma10"]
         ma20 = metrics["ma20"]
         close = metrics["close"]
+
+        trend_checks = [
+            {"label": "收盘价站上 MA20", "passed": close > ma20, "value": round(close, 3), "threshold": round(ma20, 3)},
+            {"label": "MA5 高于 MA10", "passed": ma5 > ma10, "value": round(ma5, 3), "threshold": round(ma10, 3)},
+            {"label": "MA10 高于 MA20", "passed": ma10 > ma20, "value": round(ma10, 3), "threshold": round(ma20, 3)},
+            {"label": "MA20 斜率为正", "passed": metrics["ma20_slope_pct"] > 0, "value": round(metrics["ma20_slope_pct"], 2), "threshold": 0.0},
+            {"label": "收盘价站上 MA60", "passed": close > metrics["ma60"] > 0, "value": round(close, 3), "threshold": round(metrics["ma60"], 3)},
+        ]
         trend_score = 0.0
-        if close > ma20:
+        if trend_checks[0]["passed"]:
             trend_score += 10
-        if ma5 > ma10:
+        if trend_checks[1]["passed"]:
             trend_score += 8
-        if ma10 > ma20:
+        if trend_checks[2]["passed"]:
             trend_score += 10
-        if metrics["ma20_slope_pct"] > 0:
+        if trend_checks[3]["passed"]:
             trend_score += 8
-        if close > metrics["ma60"] > 0:
+        if trend_checks[4]["passed"]:
             trend_score += 4
         trend_score = _clamp(trend_score, 0, 40)
+        trend_detail = {
+            "checks": trend_checks,
+            "close": round(close, 3),
+            "ma5": round(ma5, 3),
+            "ma10": round(ma10, 3),
+            "ma20": round(ma20, 3),
+            "ma60": round(metrics["ma60"], 3),
+            "ma20_slope_pct": round(metrics["ma20_slope_pct"], 2),
+        }
 
         volume_score = 0.0
+        volume_bucket = "low"
         if metrics["volume_ratio"] >= 1.4:
             volume_score = 15
+            volume_bucket = "high_expansion"
         elif metrics["volume_ratio"] >= 1.1:
             volume_score = 11
+            volume_bucket = "supportive"
         elif metrics["volume_ratio"] >= 0.9:
             volume_score = 7
+            volume_bucket = "neutral"
         elif metrics["volume_ratio"] >= 0.7:
             volume_score = 4
+            volume_bucket = "slightly_weak"
+        volume_detail = {
+            "volume_ratio": round(metrics["volume_ratio"], 2),
+            "bucket": volume_bucket,
+        }
 
-        sector_score = self._score_sector(board_names, top_sectors, bottom_sectors)
+        sector_score, sector_detail = self._score_sector_with_detail(board_names, top_sectors, bottom_sectors)
         risk_penalty = 0.0
+        risk_flags: List[Dict[str, Any]] = []
         if close < ma20:
             risk_penalty += 8
+            risk_flags.append({"label": "收盘价跌破 MA20", "penalty": 8.0})
         if metrics["ma20_slope_pct"] < 0:
             risk_penalty += 6
+            risk_flags.append({"label": "MA20 斜率转负", "penalty": 6.0})
         if metrics["latest_pct_chg"] < -5:
             risk_penalty += 5
+            risk_flags.append({"label": "单日跌幅过大", "penalty": 5.0})
         if ma20 > 0 and (close / ma20 - 1) * 100 > 12:
             risk_penalty += 6
+            risk_flags.append({"label": "偏离 MA20 过大", "penalty": 6.0})
+        risk_detail = {
+            "flags": risk_flags,
+            "total_penalty": round(risk_penalty, 2),
+        }
 
         setup_score = 0.0
         strict_match = False
+        strict_checks: List[Dict[str, Any]] = []
+        setup_detail: Dict[str, Any] = {
+            "template_id": template_id,
+            "change_20d_pct": round(metrics["change_20d_pct"], 2),
+            "distance_to_high_pct": round(metrics["distance_to_high_pct"], 2),
+            "pullback_from_high_pct": round(metrics["pullback_from_high_pct"], 2),
+            "latest_pct_chg": round(metrics["latest_pct_chg"], 2),
+        }
         if template_id == "trend_breakout":
             if metrics["distance_to_high_pct"] >= 0:
                 setup_score += 18
@@ -801,12 +1566,13 @@ class StockPickerService:
                 setup_score += 5
             if metrics["change_20d_pct"] > 5:
                 setup_score += 7
-            strict_match = (
-                close > ma10
-                and ma5 > ma10 > ma20
-                and metrics["distance_to_high_pct"] >= -3.5
-                and metrics["volume_ratio"] >= 0.85
-            )
+            strict_checks = [
+                {"label": "收盘价站上 MA10", "passed": close > ma10},
+                {"label": "MA5 > MA10 > MA20", "passed": ma5 > ma10 > ma20},
+                {"label": "距前高不低于 -3.5%", "passed": metrics["distance_to_high_pct"] >= -3.5},
+                {"label": "量能比不低于 0.85", "passed": metrics["volume_ratio"] >= 0.85},
+            ]
+            strict_match = all(item["passed"] for item in strict_checks)
         elif template_id == "strong_pullback":
             if metrics["change_20d_pct"] > 4:
                 setup_score += 10
@@ -818,12 +1584,13 @@ class StockPickerService:
                 setup_score += 4
             if metrics["volume_ratio"] <= 1.1:
                 setup_score += 4
-            strict_match = (
-                ma10 > ma20
-                and close >= ma20 * 0.98
-                and -6.0 <= metrics["pullback_from_high_pct"] <= 0
-                and metrics["change_20d_pct"] > 2
-            )
+            strict_checks = [
+                {"label": "MA10 高于 MA20", "passed": ma10 > ma20},
+                {"label": "收盘价不低于 MA20 的 98%", "passed": close >= ma20 * 0.98},
+                {"label": "回撤位于 -6% 到 0%", "passed": -6.0 <= metrics["pullback_from_high_pct"] <= 0},
+                {"label": "近 20 日涨幅大于 2%", "passed": metrics["change_20d_pct"] > 2},
+            ]
+            strict_match = all(item["passed"] for item in strict_checks)
         elif template_id == "balanced":
             if metrics["change_20d_pct"] > 0:
                 setup_score += 8
@@ -835,12 +1602,37 @@ class StockPickerService:
                 setup_score += 4
             if metrics["volume_ratio"] >= 0.8:
                 setup_score += 4
-            strict_match = close >= ma20 * 0.99 and metrics["change_20d_pct"] > -2
+            strict_checks = [
+                {"label": "收盘价不低于 MA20 的 99%", "passed": close >= ma20 * 0.99},
+                {"label": "近 20 日涨幅大于 -2%", "passed": metrics["change_20d_pct"] > -2},
+            ]
+            strict_match = all(item["passed"] for item in strict_checks)
         else:
             return None
 
         setup_score = _clamp(setup_score, 0, 30)
         total_score = _clamp(trend_score + setup_score + volume_score + sector_score - risk_penalty, 0, 100)
+        rules = PICKER_FALLBACK_RULES.get(template_id, PICKER_FALLBACK_RULES["balanced"])
+        fallback_checks = [
+            {"label": f"综合得分不低于 {rules['min_total_score']}", "passed": total_score >= rules["min_total_score"]},
+            {"label": f"趋势分不低于 {rules['min_trend_score']}", "passed": trend_score >= rules["min_trend_score"]},
+            {"label": f"风险扣分不高于 {rules['max_risk_penalty']}", "passed": risk_penalty <= rules["max_risk_penalty"]},
+            {"label": "收盘价不低于 MA20 的 95%", "passed": close >= ma20 * 0.95},
+        ]
+        fallback_eligible = all(item["passed"] for item in fallback_checks)
+        selection_context = {
+            "strict_match": strict_match,
+            "strict_reasons": [item["label"] for item in strict_checks if item["passed"]],
+            "strict_failures": [item["label"] for item in strict_checks if not item["passed"]],
+            "fallback_eligible": fallback_eligible,
+            "fallback_reasons": [item["label"] for item in fallback_checks if item["passed"]],
+            "fallback_failures": [item["label"] for item in fallback_checks if not item["passed"]],
+            "selection_policy": "strict_match_first_then_quality_gated_fallback",
+        }
+        setup_detail["strict_checks"] = strict_checks
+        setup_detail["fallback_checks"] = fallback_checks
+        setup_detail["strict_match"] = strict_match
+        setup_detail["fallback_eligible"] = fallback_eligible
         return {
             "strict_match": strict_match,
             "trend_score": round(trend_score, 2),
@@ -849,6 +1641,12 @@ class StockPickerService:
             "sector_score": round(sector_score, 2),
             "risk_penalty": round(risk_penalty, 2),
             "total_score": round(total_score, 2),
+            "trend_detail": trend_detail,
+            "setup_detail": setup_detail,
+            "volume_detail": volume_detail,
+            "sector_detail": sector_detail,
+            "risk_detail": risk_detail,
+            "selection_context": selection_context,
         }
 
     @staticmethod
@@ -857,23 +1655,81 @@ class StockPickerService:
         top_sectors: List[Dict[str, Any]],
         bottom_sectors: List[Dict[str, Any]],
     ) -> float:
+        score, _ = StockPickerService._score_sector_with_detail(board_names, top_sectors, bottom_sectors)
+        return score
+
+    @staticmethod
+    def _score_sector_with_detail(
+        board_names: List[str],
+        top_sectors: List[Dict[str, Any]],
+        bottom_sectors: List[Dict[str, Any]],
+    ) -> Tuple[float, Dict[str, Any]]:
         if not board_names:
-            return 0.0
-        normalized_boards = {name.strip().lower() for name in board_names if name.strip()}
-        score = 0.0
+            return 0.0, {"matched_top_sectors": [], "matched_bottom_sectors": []}
+        positive_score = 0.0
+        negative_score = 0.0
+        matched_top: List[Dict[str, Any]] = []
+        matched_bottom: List[Dict[str, Any]] = []
         for index, item in enumerate(top_sectors[:10]):
-            sector_name = str(item.get("name") or "").strip().lower()
-            if not sector_name:
+            sector_name = str(item.get("name") or "").strip()
+            match_info = StockPickerService._match_sector_name(board_names, sector_name)
+            if not match_info:
                 continue
-            if any(sector_name in board or board in sector_name for board in normalized_boards):
-                score = max(score, max(3.0, 10.0 - index * 1.2))
+            matched_score = max(3.0, 10.0 - index * 1.2)
+            if match_info["match_type"] == "fuzzy":
+                matched_score = max(2.5, matched_score - 1.0)
+            positive_score = max(positive_score, matched_score)
+            matched_top.append(
+                {
+                    "name": item.get("name"),
+                    "rank": index + 1,
+                    "change_pct": round(_safe_float(item.get("change_pct")), 2) if item.get("change_pct") is not None else None,
+                    "matched_board": match_info["matched_board"],
+                    "match_type": match_info["match_type"],
+                }
+            )
         for index, item in enumerate(bottom_sectors[:10]):
-            sector_name = str(item.get("name") or "").strip().lower()
-            if not sector_name:
+            sector_name = str(item.get("name") or "").strip()
+            match_info = StockPickerService._match_sector_name(board_names, sector_name)
+            if not match_info:
                 continue
-            if any(sector_name in board or board in sector_name for board in normalized_boards):
-                score = min(score, -max(2.0, 7.0 - index * 0.8))
-        return round(score, 2)
+            matched_score = max(2.0, 7.0 - index * 0.8)
+            if match_info["match_type"] == "fuzzy":
+                matched_score = max(1.5, matched_score - 0.8)
+            negative_score = min(negative_score, -matched_score)
+            matched_bottom.append(
+                {
+                    "name": item.get("name"),
+                    "rank": index + 1,
+                    "change_pct": round(_safe_float(item.get("change_pct")), 2) if item.get("change_pct") is not None else None,
+                    "matched_board": match_info["matched_board"],
+                    "match_type": match_info["match_type"],
+                }
+            )
+        score = _clamp(positive_score + negative_score, -7.0, 10.0)
+        return round(score, 2), {
+            "matched_top_sectors": matched_top[:3],
+            "matched_bottom_sectors": matched_bottom[:3],
+            "score_components": {
+                "positive_score": round(positive_score, 2),
+                "negative_score": round(negative_score, 2),
+            },
+        }
+
+    @staticmethod
+    def _rank_candidates(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return sorted(
+            candidates,
+            key=lambda item: (
+                -_safe_float(item.get("total_score")),
+                -int(bool(item.get("strict_match"))),
+                -_safe_float(item.get("trend_score")),
+                -_safe_float(item.get("setup_score")),
+                -_safe_float(item.get("volume_score")),
+                -_safe_float(item.get("sector_score")),
+                str(item.get("code") or ""),
+            ),
+        )
 
     @staticmethod
     def _select_candidates(candidates: List[Dict[str, Any]], *, limit: int) -> List[Dict[str, Any]]:
@@ -889,7 +1745,7 @@ class StockPickerService:
 
         if len(selected) < limit:
             for candidate in candidates:
-                if candidate["code"] in seen:
+                if candidate["code"] in seen or not candidate.get("fallback_eligible", False):
                     continue
                 clone = deepcopy(candidate)
                 clone["selection_reason"] = "fallback_fill"
@@ -954,7 +1810,9 @@ class StockPickerService:
         analyzer: GeminiAnalyzer,
         template_name: str,
         candidate: Dict[str, Any],
+        base_explanation: Optional[Dict[str, List[str] | str]] = None,
     ) -> Optional[Dict[str, Any]]:
+        structured = base_explanation or self._build_structured_explanation(template_name, candidate)
         compact_news = [
             {
                 "title": _truncate_text(item.get("title"), 80),
@@ -974,14 +1832,12 @@ class StockPickerService:
             if item.get("score_name") != "total_score"
         ]
         prompt = (
-            "你是股票候选解释助手。不要重新排序，不要给出任何收益承诺。\n"
-            "请基于给定结构化数据，输出严格 JSON，不要添加 Markdown 代码块。\n"
+            "你是股票候选解释助手。不要重新排序，不要给出任何收益承诺，也不要引入结构化数据中不存在的新事实。\n"
+            "请只润色摘要，不要改写结构化理由、风险和观察点。\n"
+            "输出严格 JSON，不要添加 Markdown 代码块。\n"
             "JSON 结构如下：\n"
             "{\n"
-            '  "summary": "40字以内总结",\n'
-            '  "rationale": ["理由1", "理由2", "理由3"],\n'
-            '  "risks": ["风险1", "风险2"],\n'
-            '  "watchpoints": ["观察点1", "观察点2"]\n'
+            '  "summary": "40字以内总结"\n'
             "}\n\n"
             f"模板：{template_name}\n"
             f"股票：{candidate['name']} ({candidate['code']})\n"
@@ -991,19 +1847,92 @@ class StockPickerService:
             f"核心板块：{json.dumps((candidate.get('board_names') or [])[:6], ensure_ascii=False)}\n"
             f"最近新闻摘要：{json.dumps(compact_news, ensure_ascii=False)}\n"
             f"评分拆解：{json.dumps(compact_scores, ensure_ascii=False)}\n"
+            f"结构化解释草案：{json.dumps(structured, ensure_ascii=False)}\n"
         )
         raw_text = analyzer.generate_text(prompt, max_tokens=800, temperature=0.2)
         payload = _clean_json_block(raw_text or "")
         if not payload:
             return None
-        rationale = [str(item).strip() for item in payload.get("rationale", []) if str(item).strip()]
-        risks = [str(item).strip() for item in payload.get("risks", []) if str(item).strip()]
-        watchpoints = [str(item).strip() for item in payload.get("watchpoints", []) if str(item).strip()]
         summary = str(payload.get("summary") or "").strip()
         if not summary:
             return None
         return {
             "summary": summary,
+            "rationale": list(structured["rationale"])[:4],
+            "risks": list(structured["risks"])[:3],
+            "watchpoints": list(structured["watchpoints"])[:3],
+        }
+
+    @staticmethod
+    def _build_structured_explanation(template_name: str, candidate: Dict[str, Any]) -> Dict[str, List[str] | str]:
+        snapshot = candidate["technical_snapshot"]
+        selection_context = snapshot.get("selection_context") or {}
+        change20d_pct = round(_safe_float(snapshot.get("change20d_pct")), 2)
+        pullback_from_high_pct = round(_safe_float(snapshot.get("pullback_from_high_pct")), 2)
+        ma10 = round(_safe_float(snapshot.get("ma10")), 3)
+        ma20 = round(_safe_float(snapshot.get("ma20")), 3)
+        ma20_slope_pct = round(_safe_float(snapshot.get("ma20_slope_pct")), 2)
+        distance_to_high_pct = round(_safe_float(candidate.get("distance_to_high_pct")), 2)
+        volume_ratio = round(_safe_float(candidate.get("volume_ratio"), 1.0), 2)
+        score_map = {
+            "trend_score": _score_value(candidate, "trend_score"),
+            "setup_score": _score_value(candidate, "setup_score"),
+            "volume_score": _score_value(candidate, "volume_score"),
+            "sector_score": _score_value(candidate, "sector_score"),
+            "news_score": _score_value(candidate, "news_score"),
+        }
+        rationale: List[str] = []
+        if selection_context.get("strict_match"):
+            reasons = "、".join(selection_context.get("strict_reasons") or ["满足主要模板条件"])
+            rationale.append(f"严格命中条件：{reasons}")
+        else:
+            reasons = "、".join(selection_context.get("fallback_reasons") or ["满足补位质量门槛"])
+            rationale.append(f"补位候选依据：{reasons}")
+        rationale.append(
+            "结构化得分："
+            f"趋势 {score_map['trend_score']:.1f}、模板 {score_map['setup_score']:.1f}、"
+            f"量能 {score_map['volume_score']:.1f}、板块 {score_map['sector_score']:.1f}"
+        )
+        rationale.append(
+            f"技术快照：近20日涨跌幅 {change20d_pct}%，距阶段高点 {distance_to_high_pct}%，"
+            f"量能比 {volume_ratio}"
+        )
+        if candidate["board_names"]:
+            rationale.append(f"所属板块：{'、'.join(candidate['board_names'][:3])}")
+        elif score_map["news_score"] != 0:
+            rationale.append(f"新闻情绪得分 {score_map['news_score']:.1f}")
+
+        risks: List[str] = []
+        risk_detail = next(
+            (item.get("detail") for item in candidate["score_breakdown"] if item.get("score_name") == "risk_penalty"),
+            {},
+        ) or {}
+        for flag in risk_detail.get("flags") or []:
+            label = str(flag.get("label") or "").strip()
+            if label:
+                risks.append(label)
+        if pullback_from_high_pct < -6:
+            risks.append("距近 20 日高点回撤偏大，需防趋势衰减")
+        if ma20_slope_pct < 0:
+            risks.append("MA20 仍在走弱，确认性不足")
+        if not risks:
+            risks.append("重点留意量价是否继续配合，避免假突破或回踩失守")
+
+        watchpoints: List[str] = [
+            f"关注 MA10/MA20 附近支撑：{ma10} / {ma20}",
+            f"关注量能是否维持在均量以上，当前量能比 {volume_ratio}",
+        ]
+        if distance_to_high_pct > -2:
+            watchpoints.append("关注能否有效站稳阶段高点附近")
+        fallback_failures = selection_context.get("fallback_failures") or []
+        if fallback_failures:
+            watchpoints.append(f"补位未满足项：{'、'.join(fallback_failures[:2])}")
+
+        return {
+            "summary": (
+                f"{candidate['name']} 当前为{template_name}"
+                f"{'严格命中' if selection_context.get('strict_match') else '补位'}候选，综合得分 {candidate['total_score']}。"
+            ),
             "rationale": rationale[:4],
             "risks": risks[:3],
             "watchpoints": watchpoints[:3],
@@ -1011,39 +1940,7 @@ class StockPickerService:
 
     @staticmethod
     def _build_fallback_explanation(template_name: str, candidate: Dict[str, Any]) -> Dict[str, List[str] | str]:
-        snapshot = candidate["technical_snapshot"]
-        rationale = [
-            f"{template_name} 模板得分 {candidate['total_score']}，趋势结构得分 {candidate['trend_score']}",
-            f"近 20 日涨跌幅 {snapshot['change20d_pct']}%，距阶段高点 {candidate['distance_to_high_pct']}%",
-        ]
-        if candidate["board_names"]:
-            rationale.append(f"所属板块：{'、'.join(candidate['board_names'][:3])}")
-        if candidate["news_briefs"]:
-            rationale.append(f"近端资讯偏 {'正面' if candidate['news_score'] >= 0 else '谨慎'}")
-
-        risks = []
-        if candidate["risk_penalty"] > 0:
-            risks.append(f"风险扣分 {candidate['risk_penalty']}，说明当前形态并非无瑕疵")
-        if snapshot["pullback_from_high_pct"] < -6:
-            risks.append("距近 20 日高点回撤偏大，需防趋势衰减")
-        if snapshot["ma20_slope_pct"] < 0:
-            risks.append("MA20 仍在走弱，确认性不足")
-        if not risks:
-            risks.append("重点留意量价是否继续配合，避免假突破或回踩失守")
-
-        watchpoints = [
-            f"关注 MA10/MA20 附近支撑：{snapshot['ma10']} / {snapshot['ma20']}",
-            f"关注量能是否维持在均量以上，当前量能比 {candidate['volume_ratio']}",
-        ]
-        if candidate["distance_to_high_pct"] > -2:
-            watchpoints.append("关注能否有效站稳阶段高点附近")
-
-        return {
-            "summary": f"{candidate['name']} 当前为 {template_name} 候选，综合得分 {candidate['total_score']}。",
-            "rationale": rationale[:4],
-            "risks": risks[:3],
-            "watchpoints": watchpoints[:3],
-        }
+        return StockPickerService._build_structured_explanation(template_name, candidate)
 
     @staticmethod
     def _replace_score(candidate: Dict[str, Any], score_name: str, score_label: str, score_value: float) -> None:
@@ -1084,21 +1981,28 @@ class StockPickerService:
             return [], []
 
     def _load_sector_catalog(self) -> Dict[str, Any]:
+        cache_key = get_effective_trading_date("cn", current_time=datetime.now()).isoformat()
         cached = self._sector_catalog_cache
-        if cached is not None:
+        if cached is not None and getattr(self, "_sector_catalog_cache_key", None) == cache_key:
             return cached
 
         with self._sector_cache_lock:
-            if self._sector_catalog_cache is not None:
+            if (
+                self._sector_catalog_cache is not None
+                and getattr(self, "_sector_catalog_cache_key", None) == cache_key
+            ):
                 return self._sector_catalog_cache
 
             fetcher_manager = DataFetcherManager()
             catalog = self._build_sector_catalog(fetcher_manager)
             self._sector_catalog_cache = catalog
+            self._sector_catalog_cache_key = cache_key
             return catalog
 
     @staticmethod
     def _build_sector_catalog(fetcher_manager: DataFetcherManager) -> Dict[str, Any]:
+        top_sectors, bottom_sectors = StockPickerService._load_sector_rankings(fetcher_manager)
+        quality_index = StockPickerService._build_sector_quality_index(top_sectors, bottom_sectors)
         get_fetchers_snapshot = getattr(fetcher_manager, "_get_fetchers_snapshot", None)
         if callable(get_fetchers_snapshot):
             fetchers = get_fetchers_snapshot()
@@ -1139,24 +2043,62 @@ class StockPickerService:
                 if not deduped_codes:
                     continue
                 code_by_sector[str(industry_name)] = deduped_codes
+                quality = StockPickerService._resolve_sector_quality(industry_name, quality_index)
                 items.append(
                     {
                         "sector_id": str(industry_name),
                         "name": str(industry_name),
+                        "description": f"基于股票清单行业字段动态构建的 A股行业板块：{industry_name}",
                         "market": "cn",
                         "stock_count": len(deduped_codes),
+                        "strength_label": quality["strength_label"],
+                        "rank_direction": quality["rank_direction"],
+                        "rank_position": quality["rank_position"],
+                        "change_pct": quality["change_pct"],
+                        "is_ranked_today": quality["is_ranked_today"],
                     }
                 )
 
-            items.sort(key=lambda item: (-int(item["stock_count"]), str(item["name"])))
+            items.sort(
+                key=lambda item: (
+                    -int(
+                        StockPickerService._resolve_sector_quality(
+                            item["name"],
+                            quality_index,
+                        )["strength_priority"]
+                    ),
+                    int(item.get("rank_position") or 999),
+                    -int(item["stock_count"]),
+                    str(item["name"]),
+                )
+            )
             if items:
+                signature_source = "|".join(
+                    f"{str(item['sector_id'])}:{item.get('rank_direction') or 'neutral'}:{item.get('rank_position') or 0}:{int(item['stock_count'])}"
+                    for item in items
+                )
                 return {
                     "items": items,
                     "code_by_sector": code_by_sector,
+                    "catalog_policy": "dynamic_a_share_industry_from_stock_list",
+                    "source_name": str(getattr(fetcher, "name", fetcher.__class__.__name__)),
+                    "sector_count": len(items),
+                    "stock_count": len(_dedupe_codes([code for codes in code_by_sector.values() for code in codes])),
+                    "catalog_signature": hashlib.sha1(signature_source.encode("utf-8")).hexdigest()[:12],
+                    "quality_policy": "sector_rankings_top_bottom_augmented_sort",
                 }
 
         logger.warning("[StockPicker] no A-share sector catalog available from current data sources")
-        return {"items": [], "code_by_sector": {}}
+        return {
+            "items": [],
+            "code_by_sector": {},
+            "catalog_policy": "dynamic_a_share_industry_from_stock_list",
+            "source_name": None,
+            "sector_count": 0,
+            "stock_count": 0,
+            "catalog_signature": "empty",
+            "quality_policy": "sector_rankings_top_bottom_augmented_sort",
+        }
 
     def _ensure_task_evaluations(self, task_id: str) -> None:
         for window_days in PICKER_EVAL_WINDOWS:
@@ -1167,45 +2109,120 @@ class StockPickerService:
         for task_id in completed_task_ids:
             self._ensure_task_window_evaluations(task_id=task_id, window_days=window_days)
 
-    def _ensure_task_window_evaluations(self, *, task_id: str, window_days: int) -> None:
+    def _ensure_task_window_evaluations(
+        self,
+        *,
+        task_id: str,
+        window_days: int,
+        fetcher_manager: Optional[DataFetcherManager] = None,
+        force: bool = False,
+        dry_run: bool = False,
+    ) -> Dict[str, int]:
+        summary: Dict[str, int] = defaultdict(int)
         candidate_rows = self._repo.get_task_candidate_rows(task_id)
         if not candidate_rows:
-            return
+            return {"candidate_count": 0}
 
         existing = {
             (int(item["candidate_id"]), int(item["window_days"])): item
             for item in self._repo.list_task_evaluations(task_id, window_days=window_days)
         }
-        fetcher_manager = DataFetcherManager()
+        summary["candidate_count"] = len(candidate_rows)
+        active_fetcher = fetcher_manager or DataFetcherManager()
         for candidate in candidate_rows:
             if candidate["market"] != "cn" or not candidate.get("latest_date"):
+                if candidate["market"] != "cn":
+                    summary["skipped_non_cn"] += 1
+                else:
+                    summary["skipped_missing_analysis_date"] += 1
                 continue
             key = (int(candidate["candidate_id"]), int(window_days))
             existing_payload = existing.get(key)
-            if existing_payload and existing_payload.get("eval_status") == "completed":
+            if not force and existing_payload and existing_payload.get("eval_status") == "completed":
+                summary["skipped_completed"] += 1
                 continue
             payload = self._evaluate_candidate_window(
                 code=str(candidate["code"]),
                 analysis_date=candidate["latest_date"],
                 window_days=window_days,
-                fetcher_manager=fetcher_manager,
+                fetcher_manager=active_fetcher,
             )
-            self._repo.upsert_candidate_evaluation(
-                picker_candidate_id=int(candidate["candidate_id"]),
-                window_days=window_days,
-                benchmark_code=DEFAULT_PICKER_BENCHMARK_CODE,
-                eval_status=str(payload["eval_status"]),
-                entry_date=payload.get("entry_date"),
-                entry_price=payload.get("entry_price"),
-                exit_date=payload.get("exit_date"),
-                exit_price=payload.get("exit_price"),
-                benchmark_entry_price=payload.get("benchmark_entry_price"),
-                benchmark_exit_price=payload.get("benchmark_exit_price"),
-                return_pct=payload.get("return_pct"),
-                benchmark_return_pct=payload.get("benchmark_return_pct"),
-                excess_return_pct=payload.get("excess_return_pct"),
-                max_drawdown_pct=payload.get("max_drawdown_pct"),
-            )
+            summary[str(payload["eval_status"])] += 1
+            if not dry_run:
+                self._repo.upsert_candidate_evaluation(
+                    picker_candidate_id=int(candidate["candidate_id"]),
+                    window_days=window_days,
+                    benchmark_code=DEFAULT_PICKER_BENCHMARK_CODE,
+                    eval_status=str(payload["eval_status"]),
+                    entry_date=payload.get("entry_date"),
+                    entry_price=payload.get("entry_price"),
+                    exit_date=payload.get("exit_date"),
+                    exit_price=payload.get("exit_price"),
+                    benchmark_entry_price=payload.get("benchmark_entry_price"),
+                    benchmark_exit_price=payload.get("benchmark_exit_price"),
+                    return_pct=payload.get("return_pct"),
+                    benchmark_return_pct=payload.get("benchmark_return_pct"),
+                    excess_return_pct=payload.get("excess_return_pct"),
+                    max_drawdown_pct=payload.get("max_drawdown_pct"),
+                )
+        return dict(summary)
+
+    def backfill_evaluations(
+        self,
+        *,
+        task_id: Optional[str] = None,
+        window_days: Optional[Sequence[int]] = None,
+        since: Optional[date] = None,
+        limit: Optional[int] = None,
+        dry_run: bool = False,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        windows = [int(item) for item in (window_days or PICKER_EVAL_WINDOWS)]
+        invalid_windows = [item for item in windows if item not in PICKER_EVAL_WINDOWS]
+        if invalid_windows:
+            raise ValueError(f"window_days 必须为 {', '.join(str(item) for item in PICKER_EVAL_WINDOWS)} 之一。")
+
+        task_ids = [str(task_id)] if task_id else self._repo.list_task_ids_for_backfill(
+            status="completed",
+            since=since,
+            limit=limit,
+        )
+        fetcher_manager = DataFetcherManager()
+        per_window: Dict[int, Dict[str, int]] = {}
+        for item in windows:
+            per_window[item] = {
+                "candidate_count": 0,
+                "completed": 0,
+                "pending": 0,
+                "benchmark_unavailable": 0,
+                "invalid": 0,
+                "skipped_completed": 0,
+                "skipped_non_cn": 0,
+                "skipped_missing_analysis_date": 0,
+            }
+
+        for current_task_id in task_ids:
+            for current_window in windows:
+                window_summary = self._ensure_task_window_evaluations(
+                    task_id=current_task_id,
+                    window_days=current_window,
+                    fetcher_manager=fetcher_manager,
+                    force=force,
+                    dry_run=dry_run,
+                )
+                for key, value in window_summary.items():
+                    per_window[current_window][key] = per_window[current_window].get(key, 0) + int(value)
+
+        return {
+            "task_count": len(task_ids),
+            "task_ids": task_ids,
+            "window_days": windows,
+            "benchmark_code": DEFAULT_PICKER_BENCHMARK_CODE,
+            "dry_run": bool(dry_run),
+            "force": bool(force),
+            "since": since.isoformat() if since else None,
+            "per_window": per_window,
+        }
 
     def _evaluate_candidate_window(
         self,
@@ -1214,12 +2231,14 @@ class StockPickerService:
         analysis_date: date,
         window_days: int,
         fetcher_manager: DataFetcherManager,
+        refresh_missing_data: bool = True,
     ) -> Dict[str, Any]:
         candidate_bars = self._load_forward_bars(
             code=code,
             analysis_date=analysis_date,
             window_days=window_days,
             fetcher_manager=fetcher_manager,
+            refresh_missing_data=refresh_missing_data,
         )
         if len(candidate_bars) < window_days:
             return {
@@ -1264,6 +2283,7 @@ class StockPickerService:
             analysis_date=analysis_date,
             window_days=window_days,
             fetcher_manager=fetcher_manager,
+            refresh_missing_data=refresh_missing_data,
         )
         benchmark_entry_price = None
         benchmark_exit_price = None
@@ -1277,7 +2297,7 @@ class StockPickerService:
                 excess_return_pct = round(return_pct - benchmark_return_pct, 2)
 
         return {
-            "eval_status": "completed",
+            "eval_status": "completed" if excess_return_pct is not None else "benchmark_unavailable",
             "entry_date": getattr(entry_bar, "date", None),
             "entry_price": round(entry_price, 3),
             "exit_date": getattr(exit_bar, "date", None),
@@ -1297,6 +2317,7 @@ class StockPickerService:
         analysis_date: date,
         window_days: int,
         fetcher_manager: DataFetcherManager,
+        refresh_missing_data: bool = True,
     ) -> List[Any]:
         bars = self._stock_repo.get_forward_bars(
             code=normalize_stock_code(code),
@@ -1305,6 +2326,22 @@ class StockPickerService:
         )
         if len(bars) >= window_days:
             return bars
+
+        if not refresh_missing_data:
+            return bars
+
+        normalized_code = normalize_stock_code(code)
+        if normalized_code == DEFAULT_PICKER_BENCHMARK_CODE:
+            refreshed = self._refresh_benchmark_daily_data(
+                fetcher_manager=fetcher_manager,
+                days=max(120, window_days * 12),
+            )
+            if refreshed:
+                return self._stock_repo.get_forward_bars(
+                    code=DEFAULT_PICKER_BENCHMARK_CODE,
+                    analysis_date=analysis_date,
+                    eval_window_days=window_days,
+                )
 
         refresh_days = max(90, window_days * 8)
         try:
@@ -1320,6 +2357,69 @@ class StockPickerService:
             analysis_date=analysis_date,
             eval_window_days=window_days,
         )
+
+    def _refresh_benchmark_daily_data(
+        self,
+        *,
+        fetcher_manager: DataFetcherManager,
+        days: int,
+    ) -> bool:
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=max(days * 2, 240))).strftime("%Y-%m-%d")
+
+        get_fetchers_snapshot = getattr(fetcher_manager, "_get_fetchers_snapshot", None)
+        fetchers = list(get_fetchers_snapshot()) if callable(get_fetchers_snapshot) else list(getattr(fetcher_manager, "_fetchers", []))
+
+        # 1) Prefer Tushare index_daily for CN benchmark to preserve domestic session semantics.
+        for fetcher in fetchers:
+            if getattr(fetcher, "name", "") != "TushareFetcher":
+                continue
+            api = getattr(fetcher, "_api", None)
+            if api is None:
+                continue
+            try:
+                raw_df = api.index_daily(
+                    ts_code="000300.SH",
+                    start_date=start_date.replace("-", ""),
+                    end_date=end_date.replace("-", ""),
+                )
+                if raw_df is None or raw_df.empty:
+                    continue
+                normalized = fetcher._normalize_data(raw_df, "000300.SH")
+                normalized = fetcher._clean_data(normalized)
+                normalized = fetcher._calculate_indicators(normalized)
+                self._stock_repo.save_dataframe(
+                    normalized,
+                    DEFAULT_PICKER_BENCHMARK_CODE,
+                    data_source="TushareFetcher:index_daily",
+                )
+                return True
+            except Exception as exc:
+                logger.debug("[StockPicker] benchmark refresh via Tushare index_daily failed: %s", exc, exc_info=True)
+
+        # 2) Fallback to Yahoo Finance A-share index symbol mapping.
+        for fetcher in fetchers:
+            if getattr(fetcher, "name", "") != "YfinanceFetcher":
+                continue
+            try:
+                normalized = fetcher.get_daily_data(
+                    "000300.SS",
+                    start_date=start_date,
+                    end_date=end_date,
+                    days=max(days, 120),
+                )
+                if normalized is None or normalized.empty:
+                    continue
+                self._stock_repo.save_dataframe(
+                    normalized,
+                    DEFAULT_PICKER_BENCHMARK_CODE,
+                    data_source="YfinanceFetcher:000300.SS",
+                )
+                return True
+            except Exception as exc:
+                logger.debug("[StockPicker] benchmark refresh via YFinance failed: %s", exc, exc_info=True)
+
+        return False
 
     @staticmethod
     def _build_task_notification_content(

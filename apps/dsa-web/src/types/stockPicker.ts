@@ -19,8 +19,14 @@ export interface PickerUniverseItem {
 export interface PickerSectorItem {
   sectorId: string;
   name: string;
+  description?: string | null;
   market: string;
   stockCount: number;
+  strengthLabel?: string | null;
+  rankDirection?: 'top' | 'bottom' | null;
+  rankPosition?: number | null;
+  changePct?: number | null;
+  isRankedToday?: boolean;
 }
 
 export interface PickerTaskSummary {
@@ -34,8 +40,17 @@ export interface PickerTaskSummary {
   errorCount: number;
   strictMatchCount: number;
   selectedCount: number;
+  qualifiedFallbackCount?: number;
   fallbackCount: number;
   explainedCount: number;
+  insufficientReasonBreakdown?: Record<string, number>;
+  insufficientReasonLabels?: Record<string, string>;
+  tradingDatePolicy?: Record<string, unknown>;
+  sectorCatalogSnapshot?: Record<string, unknown>;
+  sectorQualitySummary?: Record<string, unknown>;
+  rankedSectorBreakdown?: Array<Record<string, unknown>>;
+  benchmarkPolicy?: Record<string, unknown>;
+  selectionQualityGate?: Record<string, unknown>;
 }
 
 export interface PickerScoreItem {
@@ -57,6 +72,8 @@ export interface PickerCandidateEvaluationItem {
   windowDays: number;
   benchmarkCode?: string | null;
   evalStatus: string;
+  benchmarkStatus?: string | null;
+  isComparable?: boolean;
   entryDate?: string | null;
   entryPrice?: number | null;
   exitDate?: string | null;
@@ -149,6 +166,8 @@ export interface PickerTemplateStatItem {
   templateName: string;
   windowDays: number;
   totalEvaluations: number;
+  comparableEvaluations?: number;
+  benchmarkUnavailableEvaluations?: number;
   winRatePct?: number | null;
   avgReturnPct?: number | null;
   avgExcessReturnPct?: number | null;

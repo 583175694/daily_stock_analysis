@@ -37,6 +37,16 @@ def _iso_date(value: Optional[date]) -> Optional[str]:
     return value.isoformat() if value else None
 
 
+def _benchmark_status(eval_status: str, benchmark_return_pct: Optional[float], excess_return_pct: Optional[float]) -> str:
+    if eval_status == "benchmark_unavailable":
+        return "unavailable"
+    if eval_status != "completed":
+        return eval_status
+    if benchmark_return_pct is None or excess_return_pct is None:
+        return "unavailable"
+    return "completed"
+
+
 class StockPickerRepository:
     """Persistence adapter for stock-picker tasks and results."""
 
@@ -62,6 +72,7 @@ class StockPickerRepository:
         *,
         task_id: str,
         template_id: str,
+        template_version: str,
         universe_id: str,
         limit: int,
         ai_top_k: int,
@@ -74,7 +85,7 @@ class StockPickerRepository:
                     task_id=task_id,
                     status="queued",
                     template_id=template_id,
-                    template_version="v1",
+                    template_version=template_version,
                     universe_id=universe_id,
                     result_limit=limit,
                     ai_top_k=ai_top_k,
@@ -215,10 +226,23 @@ class StockPickerRepository:
             return [self._serialize_task(row) for row in rows]
 
     def list_task_ids(self, *, status: Optional[str] = None) -> List[str]:
+        return self.list_task_ids_for_backfill(status=status)
+
+    def list_task_ids_for_backfill(
+        self,
+        *,
+        status: Optional[str] = None,
+        since: Optional[date] = None,
+        limit: Optional[int] = None,
+    ) -> List[str]:
         with self.db.session_scope() as session:
             query = select(PickerTask.task_id).order_by(desc(PickerTask.created_at), desc(PickerTask.id))
             if status:
                 query = query.where(PickerTask.status == status)
+            if since is not None:
+                query = query.where(PickerTask.created_at >= datetime.combine(since, datetime.min.time()))
+            if limit is not None:
+                query = query.limit(max(1, int(limit)))
             rows = session.execute(query).scalars().all()
             return [str(row) for row in rows]
 
@@ -381,6 +405,12 @@ class StockPickerRepository:
                     "window_days": evaluation.window_days,
                     "benchmark_code": evaluation.benchmark_code,
                     "eval_status": evaluation.eval_status,
+                    "benchmark_status": _benchmark_status(
+                        evaluation.eval_status,
+                        evaluation.benchmark_return_pct,
+                        evaluation.excess_return_pct,
+                    ),
+                    "is_comparable": evaluation.benchmark_return_pct is not None and evaluation.excess_return_pct is not None,
                     "entry_date": _iso_date(evaluation.entry_date),
                     "entry_price": evaluation.entry_price,
                     "exit_date": _iso_date(evaluation.exit_date),
@@ -417,6 +447,12 @@ class StockPickerRepository:
                     "template_id": template_id,
                     "window_days": evaluation.window_days,
                     "eval_status": evaluation.eval_status,
+                    "benchmark_status": _benchmark_status(
+                        evaluation.eval_status,
+                        evaluation.benchmark_return_pct,
+                        evaluation.excess_return_pct,
+                    ),
+                    "is_comparable": evaluation.benchmark_return_pct is not None and evaluation.excess_return_pct is not None,
                     "return_pct": evaluation.return_pct,
                     "benchmark_return_pct": evaluation.benchmark_return_pct,
                     "excess_return_pct": evaluation.excess_return_pct,
@@ -512,6 +548,12 @@ class StockPickerRepository:
                     "window_days": evaluation_row.window_days,
                     "benchmark_code": evaluation_row.benchmark_code,
                     "eval_status": evaluation_row.eval_status,
+                    "benchmark_status": _benchmark_status(
+                        evaluation_row.eval_status,
+                        evaluation_row.benchmark_return_pct,
+                        evaluation_row.excess_return_pct,
+                    ),
+                    "is_comparable": evaluation_row.benchmark_return_pct is not None and evaluation_row.excess_return_pct is not None,
                     "entry_date": _iso_date(evaluation_row.entry_date),
                     "entry_price": evaluation_row.entry_price,
                     "exit_date": _iso_date(evaluation_row.exit_date),

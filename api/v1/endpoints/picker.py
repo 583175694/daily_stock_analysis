@@ -156,7 +156,7 @@ def get_picker_task(
     summary="获取 AI 选股模板效果统计",
 )
 def get_picker_template_stats(
-    window_days: int = Query(10, ge=1, le=20, description="统计窗口，仅支持 5/10/20"),
+    window_days: int = Query(10, ge=1, description="统计窗口，仅支持 5/10/20"),
     service: StockPickerService = Depends(get_stock_picker_service),
 ) -> PickerTemplateStatsResponse:
     try:

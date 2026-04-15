@@ -37,8 +37,14 @@ class PickerUniversesResponse(BaseModel):
 class PickerSectorItem(BaseModel):
     sector_id: str
     name: str
+    description: Optional[str] = None
     market: str = "cn"
     stock_count: int
+    strength_label: Optional[str] = None
+    rank_direction: Optional[Literal["top", "bottom"]] = None
+    rank_position: Optional[int] = None
+    change_pct: Optional[float] = None
+    is_ranked_today: bool = False
 
 
 class PickerSectorsResponse(BaseModel):
@@ -52,7 +58,7 @@ class PickerRunRequest(BaseModel):
     mode: Literal["watchlist", "sector"] = Field("watchlist", description="运行模式：自选股或板块模式")
     sector_ids: List[str] = Field(default_factory=list, description="板块模式下所选板块 ID 列表")
     limit: int = Field(20, ge=1, le=30, description="返回候选数量上限")
-    ai_top_k: int = Field(5, ge=1, le=8, description="AI 解释候选数量上限")
+    ai_top_k: int = Field(5, ge=1, le=10, description="AI 解释候选数量上限")
     force_refresh: bool = Field(False, description="是否强制刷新行情数据")
     notify: bool = Field(False, description="任务完成后是否发送摘要通知")
 
@@ -73,8 +79,17 @@ class PickerTaskSummary(BaseModel):
     error_count: int = 0
     strict_match_count: int = 0
     selected_count: int = 0
+    qualified_fallback_count: int = 0
     fallback_count: int = 0
     explained_count: int = 0
+    insufficient_reason_breakdown: Dict[str, int] = Field(default_factory=dict)
+    insufficient_reason_labels: Dict[str, str] = Field(default_factory=dict)
+    trading_date_policy: Dict[str, Any] = Field(default_factory=dict)
+    sector_catalog_snapshot: Dict[str, Any] = Field(default_factory=dict)
+    sector_quality_summary: Dict[str, Any] = Field(default_factory=dict)
+    ranked_sector_breakdown: List[Dict[str, Any]] = Field(default_factory=list)
+    benchmark_policy: Dict[str, Any] = Field(default_factory=dict)
+    selection_quality_gate: Dict[str, Any] = Field(default_factory=dict)
 
 
 class PickerTaskItem(BaseModel):
@@ -159,6 +174,8 @@ class PickerTemplateStatItem(BaseModel):
     template_name: str
     window_days: int
     total_evaluations: int = 0
+    comparable_evaluations: int = 0
+    benchmark_unavailable_evaluations: int = 0
     win_rate_pct: Optional[float] = None
     avg_return_pct: Optional[float] = None
     avg_excess_return_pct: Optional[float] = None

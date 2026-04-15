@@ -91,7 +91,7 @@ const task = {
   status: 'completed',
   templateId: 'trend_breakout',
   templateName: '趋势突破',
-  templateVersion: 'v1',
+  templateVersion: 'v3_phase2',
   universeId: 'watchlist',
   universeName: '当前自选股',
   mode: 'watchlist',
@@ -116,9 +116,26 @@ const task = {
     selectedCount: 1,
     fallbackCount: 0,
     explainedCount: 1,
+    tradingDatePolicy: {
+      marketTargetDates: {
+        cn: '2026-04-12',
+      },
+    },
+    benchmarkPolicy: {
+      benchmarkCode: '000300',
+    },
+    selectionQualityGate: {
+      selectionPolicy: 'strict_match_first_then_quality_gated_fallback',
+    },
+    sectorQualitySummary: {
+      selectedSectorCount: 0,
+    },
+    rankedSectorBreakdown: [],
   },
   errorMessage: null,
-  requestPayload: {},
+  requestPayload: {
+    requestPolicyVersion: 'v3_phase2',
+  },
   createdAt: '2026-04-13T09:00:00Z',
   startedAt: '2026-04-13T09:01:00Z',
   finishedAt: '2026-04-13T09:02:00Z',
@@ -150,6 +167,8 @@ const candidate = {
     ma60: 1511.07,
     change5dPct: 4.12,
     change20dPct: 11.8,
+    targetTradingDate: '2026-04-12',
+    explanationSource: 'structured_plus_ai_summary',
   },
   scoreBreakdown: [
     {
@@ -183,6 +202,12 @@ const sector = {
   name: '白酒',
   market: 'cn',
   stockCount: 32,
+  description: '基于股票清单行业字段动态构建的 A股行业板块：白酒',
+  strengthLabel: '强势',
+  rankDirection: 'top' as const,
+  rankPosition: 2,
+  changePct: 3.2,
+  isRankedToday: true,
 };
 
 const templateStats = {
@@ -194,6 +219,8 @@ const templateStats = {
       templateName: '趋势突破',
       windowDays: 10,
       totalEvaluations: 6,
+      comparableEvaluations: 5,
+      benchmarkUnavailableEvaluations: 1,
       winRatePct: 66.7,
       avgReturnPct: 4.2,
       avgExcessReturnPct: 2.1,
@@ -246,6 +273,9 @@ describe('StockPickerPage', () => {
     expect(universeSelect).toHaveValue('watchlist');
     expect(screen.getByText(/当前股票池预览：600519、AAPL、HK00700/)).toBeInTheDocument();
     expect(await screen.findByText('模板效果统计')).toBeInTheDocument();
+    expect(screen.getByText('规则版本：v3_phase2')).toBeInTheDocument();
+    expect(screen.getByText('目标交易日：A股：2026-04-12')).toBeInTheDocument();
+    expect(screen.getByText('可比样本 5 / 6')).toBeInTheDocument();
 
     expect(await screen.findByRole('button', { name: '分析该股' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '去问股' })).toBeInTheDocument();
@@ -308,6 +338,46 @@ describe('StockPickerPage', () => {
     expect(screen.getByText('5日窗口')).toBeInTheDocument();
     expect(screen.getByText('收益率：2.65%')).toBeInTheDocument();
     expect(screen.getByText('超额收益：1.50%')).toBeInTheDocument();
+    expect(screen.getByText('解释来源：结构化解释 + AI 摘要润色')).toBeInTheDocument();
+  });
+
+  it('shows benchmark unavailable hint when evaluation is not comparable', async () => {
+    vi.mocked(stockPickerApi.getTask).mockResolvedValue({
+      ...task,
+      candidates: [
+        {
+          ...candidate,
+          evaluations: [
+            {
+              windowDays: 10,
+              benchmarkCode: '000300',
+              evalStatus: 'benchmark_unavailable',
+              entryDate: '2026-04-13',
+              entryPrice: 1666.66,
+              exitDate: '2026-04-24',
+              exitPrice: 1710.88,
+              benchmarkEntryPrice: null,
+              benchmarkExitPrice: null,
+              returnPct: 2.65,
+              benchmarkReturnPct: null,
+              excessReturnPct: null,
+              maxDrawdownPct: 1.2,
+              isComparable: false,
+            },
+          ],
+        },
+      ],
+    });
+
+    render(
+      <MemoryRouter>
+        <StockPickerPage />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '查看详情' }));
+
+    expect(await screen.findByText('当前窗口已完成个股收益计算，但基准收益暂不可用，因此不计入可比胜率。')).toBeInTheDocument();
   });
 
   it('switches to sector mode and submits selected sectors with aiTopK and notify', async () => {
@@ -322,6 +392,8 @@ describe('StockPickerPage', () => {
     fireEvent.click(await screen.findByRole('button', { name: /板块模式/ }));
     fireEvent.change(await screen.findByLabelText('A股行业板块'), { target: { value: '白酒' } });
     fireEvent.click(screen.getByRole('button', { name: '添加板块' }));
+    expect(await screen.findByText('强势')).toBeInTheDocument();
+    expect(screen.getByText('涨幅榜 #2 · 3.20%')).toBeInTheDocument();
     fireEvent.click(screen.getByLabelText('完成后通知'));
     fireEvent.change(screen.getByLabelText('AI解释数量'), { target: { value: '4' } });
     fireEvent.click(screen.getByRole('button', { name: '开始选股' }));
@@ -338,5 +410,148 @@ describe('StockPickerPage', () => {
         notify: true,
       });
     });
+  });
+
+  it('shows runtime fallback summary for running tasks', async () => {
+    vi.mocked(stockPickerApi.listTasks).mockResolvedValue([
+      {
+        ...task,
+        taskId: 'picker-task-running',
+        status: 'running',
+        mode: 'sector',
+        modeLabel: '板块模式',
+        universeId: 'sector',
+        universeName: 'A股行业板块',
+        sectorIds: ['白酒'],
+        sectorNames: ['白酒'],
+        totalStocks: 10,
+        processedStocks: 1,
+        candidateCount: 0,
+        progressPercent: 16,
+        progressMessage: '已扫描 1/10 支股票',
+        summary: {
+          totalStocks: 0,
+          scoredCount: 0,
+          insufficientCount: 0,
+          errorCount: 0,
+          strictMatchCount: 0,
+          selectedCount: 0,
+          fallbackCount: 0,
+          explainedCount: 0,
+          benchmarkPolicy: {
+            benchmarkCode: '000300',
+          },
+          selectionQualityGate: {
+            selectionPolicy: 'strict_match_first_then_quality_gated_fallback',
+          },
+          sectorCatalogSnapshot: {
+            selectedSectorCount: 1,
+            sectorCount: 50,
+            selectedStockCount: 10,
+            catalogStockCount: 800,
+          },
+          sectorQualitySummary: {
+            selectedSectorCount: 1,
+            strongCount: 1,
+            neutralCount: 0,
+            weakCount: 0,
+            rankedCount: 1,
+            topRankedCount: 1,
+            bottomRankedCount: 0,
+            avgRankedChangePct: 3.2,
+          },
+          rankedSectorBreakdown: [
+            {
+              name: '白酒',
+              strengthLabel: '强势',
+              rankDirection: 'top',
+              rankPosition: 2,
+              changePct: 3.2,
+            },
+          ],
+        },
+        requestPayload: {
+          requestPolicyVersion: 'v3_phase2',
+          mode: 'sector',
+          benchmarkPolicy: { benchmarkCode: '000300' },
+        },
+      },
+    ]);
+    vi.mocked(stockPickerApi.getTask).mockResolvedValue({
+      ...task,
+      taskId: 'picker-task-running',
+      status: 'running',
+      mode: 'sector',
+      modeLabel: '板块模式',
+      universeId: 'sector',
+      universeName: 'A股行业板块',
+      sectorIds: ['白酒'],
+      sectorNames: ['白酒'],
+      totalStocks: 10,
+      processedStocks: 1,
+      candidateCount: 0,
+      progressPercent: 16,
+      progressMessage: '已扫描 1/10 支股票',
+      summary: {
+        totalStocks: 0,
+        scoredCount: 0,
+        insufficientCount: 0,
+        errorCount: 0,
+        strictMatchCount: 0,
+        selectedCount: 0,
+        fallbackCount: 0,
+        explainedCount: 0,
+        benchmarkPolicy: {
+          benchmarkCode: '000300',
+        },
+        selectionQualityGate: {
+          selectionPolicy: 'strict_match_first_then_quality_gated_fallback',
+        },
+        sectorCatalogSnapshot: {
+          selectedSectorCount: 1,
+          sectorCount: 50,
+          selectedStockCount: 10,
+          catalogStockCount: 800,
+        },
+        sectorQualitySummary: {
+          selectedSectorCount: 1,
+          strongCount: 1,
+          neutralCount: 0,
+          weakCount: 0,
+          rankedCount: 1,
+          topRankedCount: 1,
+          bottomRankedCount: 0,
+          avgRankedChangePct: 3.2,
+        },
+        rankedSectorBreakdown: [
+          {
+            name: '白酒',
+            strengthLabel: '强势',
+            rankDirection: 'top',
+            rankPosition: 2,
+            changePct: 3.2,
+          },
+        ],
+      },
+      requestPayload: {
+        requestPolicyVersion: 'v3_phase2',
+        mode: 'sector',
+        benchmarkPolicy: { benchmarkCode: '000300' },
+      },
+      candidates: [],
+    });
+
+    render(
+      <MemoryRouter>
+        <StockPickerPage />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('股票池总数')).toBeInTheDocument();
+    expect(screen.getAllByText('10').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('1').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('基准：沪深300 (000300)').length).toBeGreaterThan(0);
+    expect(screen.getByText('选股策略：严格命中优先，其次质量门槛补位')).toBeInTheDocument();
+    expect(screen.getByText('强势 1 / 中性 0 / 弱势 0')).toBeInTheDocument();
   });
 });

@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 import unittest
-from datetime import date
+from datetime import date, datetime
 
 import pandas as pd
 
-from src.storage import DatabaseManager
+from src.storage import DatabaseManager, PickerTask
 from src.stock_picker.repository import StockPickerRepository
 
 
@@ -64,6 +64,7 @@ class TestStockPickerRepository(unittest.TestCase):
         self.repo.create_task(
             task_id="picker-task-1",
             template_id="balanced",
+            template_version="v3_phase1",
             universe_id="watchlist",
             limit=20,
             ai_top_k=5,
@@ -125,12 +126,15 @@ class TestStockPickerRepository(unittest.TestCase):
         self.assertEqual(len(evaluations), 1)
         self.assertEqual(evaluations[0]["window_days"], 5)
         self.assertEqual(evaluations[0]["eval_status"], "completed")
+        self.assertEqual(evaluations[0]["benchmark_status"], "completed")
+        self.assertTrue(evaluations[0]["is_comparable"])
         self.assertAlmostEqual(evaluations[0]["excess_return_pct"], 3.21, places=2)
 
     def test_list_task_ids_can_filter_completed_tasks(self) -> None:
         self.repo.create_task(
             task_id="picker-task-queued",
             template_id="balanced",
+            template_version="v3_phase1",
             universe_id="watchlist",
             limit=20,
             ai_top_k=5,
@@ -140,6 +144,7 @@ class TestStockPickerRepository(unittest.TestCase):
         self.repo.create_task(
             task_id="picker-task-completed",
             template_id="balanced",
+            template_version="v3_phase1",
             universe_id="watchlist",
             limit=20,
             ai_top_k=5,
@@ -157,6 +162,101 @@ class TestStockPickerRepository(unittest.TestCase):
 
         self.assertEqual(completed_ids, ["picker-task-completed"])
         self.assertEqual(all_ids, ["picker-task-completed", "picker-task-queued"])
+
+    def test_list_task_ids_for_backfill_supports_since_and_limit(self) -> None:
+        self.repo.create_task(
+            task_id="picker-task-older",
+            template_id="balanced",
+            template_version="v3_phase2",
+            universe_id="watchlist",
+            limit=20,
+            ai_top_k=5,
+            force_refresh=False,
+            request_payload={"mode": "watchlist"},
+        )
+        self.repo.create_task(
+            task_id="picker-task-newer",
+            template_id="balanced",
+            template_version="v3_phase2",
+            universe_id="watchlist",
+            limit=20,
+            ai_top_k=5,
+            force_refresh=False,
+            request_payload={"mode": "watchlist"},
+        )
+
+        with self.db.session_scope() as session:
+            tasks = {row.task_id: row for row in session.query(PickerTask).all()}
+            tasks["picker-task-older"].created_at = datetime(2026, 4, 1, 9, 0, 0)
+            tasks["picker-task-newer"].created_at = datetime(2026, 4, 12, 9, 0, 0)
+
+        filtered_ids = self.repo.list_task_ids_for_backfill(since=date(2026, 4, 10), limit=1)
+
+        self.assertEqual(filtered_ids, ["picker-task-newer"])
+
+    def test_task_detail_preserves_benchmark_unavailable_status(self) -> None:
+        self.repo.create_task(
+            task_id="picker-task-benchmark-gap",
+            template_id="balanced",
+            template_version="v3_phase1",
+            universe_id="watchlist",
+            limit=20,
+            ai_top_k=5,
+            force_refresh=False,
+            request_payload={"mode": "watchlist"},
+        )
+        self.repo.save_candidates(
+            "picker-task-benchmark-gap",
+            summary={"selected_count": 1},
+            candidates=[
+                {
+                    "rank": 1,
+                    "code": "000858",
+                    "name": "五粮液",
+                    "market": "cn",
+                    "selection_reason": "strict_match",
+                    "latest_date": date(2026, 4, 11),
+                    "latest_close": 10.8,
+                    "change_pct": 5.88,
+                    "volume_ratio": 1.35,
+                    "distance_to_high_pct": -0.8,
+                    "total_score": 92.4,
+                    "board_names": ["白酒"],
+                    "news_briefs": [],
+                    "explanation_summary": "测试摘要",
+                    "explanation_rationale": ["理由1"],
+                    "explanation_risks": ["风险1"],
+                    "explanation_watchpoints": ["观察点1"],
+                    "technical_snapshot": {},
+                    "score_breakdown": [],
+                }
+            ],
+        )
+        candidate_rows = self.repo.get_task_candidate_rows("picker-task-benchmark-gap")
+        self.repo.upsert_candidate_evaluation(
+            picker_candidate_id=candidate_rows[0]["candidate_id"],
+            window_days=10,
+            benchmark_code="000300",
+            eval_status="benchmark_unavailable",
+            entry_date=date(2026, 4, 14),
+            entry_price=10.5,
+            exit_date=date(2026, 4, 24),
+            exit_price=11.1,
+            benchmark_entry_price=None,
+            benchmark_exit_price=None,
+            return_pct=5.71,
+            benchmark_return_pct=None,
+            excess_return_pct=None,
+            max_drawdown_pct=1.8,
+        )
+
+        payload = self.repo.get_task("picker-task-benchmark-gap", include_candidates=True)
+
+        evaluation = payload["candidates"][0]["evaluations"][0]
+        self.assertEqual(evaluation["eval_status"], "benchmark_unavailable")
+        self.assertEqual(evaluation["benchmark_status"], "unavailable")
+        self.assertFalse(evaluation["is_comparable"])
+        self.assertAlmostEqual(evaluation["return_pct"], 5.71, places=2)
 
 
 if __name__ == "__main__":
