@@ -342,6 +342,8 @@ class StockPickerRepository:
         benchmark_return_pct: Optional[float],
         excess_return_pct: Optional[float],
         max_drawdown_pct: Optional[float],
+        mfe_pct: Optional[float],
+        mae_pct: Optional[float],
     ) -> None:
         with self.db.session_scope() as session:
             row = session.execute(
@@ -369,6 +371,8 @@ class StockPickerRepository:
             row.benchmark_return_pct = benchmark_return_pct
             row.excess_return_pct = excess_return_pct
             row.max_drawdown_pct = max_drawdown_pct
+            row.mfe_pct = mfe_pct
+            row.mae_pct = mae_pct
             row.updated_at = datetime.now()
 
     def list_task_evaluations(
@@ -421,6 +425,8 @@ class StockPickerRepository:
                     "benchmark_return_pct": evaluation.benchmark_return_pct,
                     "excess_return_pct": evaluation.excess_return_pct,
                     "max_drawdown_pct": evaluation.max_drawdown_pct,
+                    "mfe_pct": evaluation.mfe_pct,
+                    "mae_pct": evaluation.mae_pct,
                 }
                 for evaluation, code in rows
             ]
@@ -432,34 +438,67 @@ class StockPickerRepository:
                     PickerCandidateEvaluation,
                     PickerCandidate.code,
                     PickerCandidate.market,
+                    PickerCandidate.rank,
+                    PickerCandidate.selection_reason,
+                    PickerCandidate.latest_date,
+                    PickerCandidate.total_score,
+                    PickerCandidate.technical_snapshot_json,
                     PickerTask.template_id,
+                    PickerTask.template_version,
+                    PickerTask.summary_json,
                 )
                 .join(PickerCandidate, PickerCandidate.id == PickerCandidateEvaluation.picker_candidate_id)
                 .join(PickerTask, PickerTask.id == PickerCandidate.picker_task_id)
                 .where(PickerCandidateEvaluation.window_days == window_days)
                 .order_by(PickerCandidateEvaluation.updated_at.desc())
             ).all()
-            return [
-                {
-                    "candidate_id": evaluation.picker_candidate_id,
-                    "code": code,
-                    "market": market,
-                    "template_id": template_id,
-                    "window_days": evaluation.window_days,
-                    "eval_status": evaluation.eval_status,
-                    "benchmark_status": _benchmark_status(
-                        evaluation.eval_status,
-                        evaluation.benchmark_return_pct,
-                        evaluation.excess_return_pct,
-                    ),
-                    "is_comparable": evaluation.benchmark_return_pct is not None and evaluation.excess_return_pct is not None,
-                    "return_pct": evaluation.return_pct,
-                    "benchmark_return_pct": evaluation.benchmark_return_pct,
-                    "excess_return_pct": evaluation.excess_return_pct,
-                    "max_drawdown_pct": evaluation.max_drawdown_pct,
-                }
-                for evaluation, code, market, template_id in rows
-            ]
+            payload: List[Dict[str, Any]] = []
+            for (
+                evaluation,
+                code,
+                market,
+                rank,
+                selection_reason,
+                latest_date,
+                total_score,
+                technical_snapshot_json,
+                template_id,
+                template_version,
+                summary_json,
+            ) in rows:
+                technical_snapshot = _json_loads(technical_snapshot_json, {})
+                summary = _json_loads(summary_json, {})
+                market_regime_snapshot = summary.get("market_regime_snapshot") or {}
+                payload.append(
+                    {
+                        "candidate_id": evaluation.picker_candidate_id,
+                        "code": code,
+                        "market": market,
+                        "rank": rank,
+                        "selection_reason": selection_reason,
+                        "analysis_date": _iso_date(latest_date),
+                        "total_score": total_score,
+                        "template_id": template_id,
+                        "rule_version": template_version,
+                        "window_days": evaluation.window_days,
+                        "eval_status": evaluation.eval_status,
+                        "benchmark_status": _benchmark_status(
+                            evaluation.eval_status,
+                            evaluation.benchmark_return_pct,
+                            evaluation.excess_return_pct,
+                        ),
+                        "is_comparable": evaluation.benchmark_return_pct is not None and evaluation.excess_return_pct is not None,
+                        "return_pct": evaluation.return_pct,
+                        "benchmark_return_pct": evaluation.benchmark_return_pct,
+                        "excess_return_pct": evaluation.excess_return_pct,
+                        "max_drawdown_pct": evaluation.max_drawdown_pct,
+                        "mfe_pct": evaluation.mfe_pct,
+                        "mae_pct": evaluation.mae_pct,
+                        "market_regime": market_regime_snapshot.get("regime") or "unknown",
+                        "signal_bucket": technical_snapshot.get("signal_bucket") or "low",
+                    }
+                )
+            return payload
 
     def get_recent_daily_rows(self, code: str, *, limit: int = 90) -> List[Dict[str, Any]]:
         with self.db.session_scope() as session:
@@ -515,6 +554,7 @@ class StockPickerRepository:
         score_rows: List[PickerCandidateScore],
         evaluation_rows: List[PickerCandidateEvaluation],
     ) -> Dict[str, Any]:
+        technical_snapshot = _json_loads(row.technical_snapshot_json, {})
         return {
             "rank": row.rank,
             "code": row.code,
@@ -527,13 +567,23 @@ class StockPickerRepository:
             "volume_ratio": row.volume_ratio,
             "distance_to_high_pct": row.distance_to_high_pct,
             "total_score": row.total_score,
+            "environment_fit": technical_snapshot.get("environment_fit"),
+            "environment_fit_label": technical_snapshot.get("environment_fit_label"),
+            "signal_bucket": technical_snapshot.get("signal_bucket"),
             "board_names": _json_loads(row.board_names_json, []),
             "news_briefs": _json_loads(row.news_briefs_json, []),
             "explanation_summary": row.explanation_summary,
             "explanation_rationale": _json_loads(row.explanation_rationale_json, []),
             "explanation_risks": _json_loads(row.explanation_risks_json, []),
             "explanation_watchpoints": _json_loads(row.explanation_watchpoints_json, []),
-            "technical_snapshot": _json_loads(row.technical_snapshot_json, {}),
+            "technical_snapshot": technical_snapshot,
+            "execution_constraints": technical_snapshot.get("execution_constraints") or {},
+            "research_confidence": technical_snapshot.get("research_confidence") or {},
+            "execution_confidence": technical_snapshot.get("execution_confidence") or {},
+            "trade_plan": technical_snapshot.get("trade_plan") or {},
+            "advanced_factors": technical_snapshot.get("advanced_factors") or {},
+            "ai_review": technical_snapshot.get("ai_review") or {},
+            "template_failure_flags": technical_snapshot.get("template_failure_flags") or [],
             "score_breakdown": [
                 {
                     "score_name": score_row.score_name,
@@ -564,6 +614,8 @@ class StockPickerRepository:
                     "benchmark_return_pct": evaluation_row.benchmark_return_pct,
                     "excess_return_pct": evaluation_row.excess_return_pct,
                     "max_drawdown_pct": evaluation_row.max_drawdown_pct,
+                    "mfe_pct": evaluation_row.mfe_pct,
+                    "mae_pct": evaluation_row.mae_pct,
                 }
                 for evaluation_row in evaluation_rows
             ],

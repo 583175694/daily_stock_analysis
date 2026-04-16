@@ -6,6 +6,12 @@ export interface PickerTemplateItem {
   riskLevel: string;
   style: string;
   scoringNotes: string[];
+  alphaHypothesis?: string;
+  suitableRegimes?: string[];
+  cautionRegimes?: string[];
+  invalidRegimes?: string[];
+  exclusionConditions?: string[];
+  tradeRules?: Record<string, unknown>;
 }
 
 export interface PickerUniverseItem {
@@ -43,6 +49,9 @@ export interface PickerTaskSummary {
   qualifiedFallbackCount?: number;
   fallbackCount: number;
   explainedCount: number;
+  advancedEnrichedCount?: number;
+  aiReviewedCount?: number;
+  aiSoftVetoCount?: number;
   insufficientReasonBreakdown?: Record<string, number>;
   insufficientReasonLabels?: Record<string, string>;
   tradingDatePolicy?: Record<string, unknown>;
@@ -51,6 +60,7 @@ export interface PickerTaskSummary {
   rankedSectorBreakdown?: Array<Record<string, unknown>>;
   benchmarkPolicy?: Record<string, unknown>;
   selectionQualityGate?: Record<string, unknown>;
+  marketRegimeSnapshot?: Record<string, unknown>;
 }
 
 export interface PickerScoreItem {
@@ -84,6 +94,58 @@ export interface PickerCandidateEvaluationItem {
   benchmarkReturnPct?: number | null;
   excessReturnPct?: number | null;
   maxDrawdownPct?: number | null;
+  mfePct?: number | null;
+  maePct?: number | null;
+}
+
+export interface PickerExecutionConstraints {
+  market?: string | null;
+  status?: string | null;
+  statusLabel?: string | null;
+  notFillable?: boolean;
+  liquidityBucket?: string | null;
+  gapRisk?: string | null;
+  slippageBps?: number | null;
+  executionPenalty?: number | null;
+  estimatedCostModel?: string | null;
+  signals?: Record<string, unknown>;
+  note?: string | null;
+}
+
+export interface PickerResearchConfidence {
+  status?: string | null;
+  label?: string | null;
+  score?: number | null;
+  windowDays?: number | null;
+  benchmarkCode?: string | null;
+  templateId?: string | null;
+  marketRegime?: string | null;
+  signalBucket?: string | null;
+  comparableSamples?: number;
+  regimeComparableSamples?: number;
+  templateWinRatePct?: number | null;
+  regimeWinRatePct?: number | null;
+  templateAvgExcessReturnPct?: number | null;
+  regimeAvgExcessReturnPct?: number | null;
+  nominalProbabilityPct?: number | null;
+  calibratedWinRatePct?: number | null;
+  calibrationGapPct?: number | null;
+  ruleVersion?: string | null;
+  calibration?: Record<string, unknown>;
+  highConfidenceGate?: Record<string, unknown>;
+  note?: string | null;
+}
+
+export interface PickerExecutionConfidence {
+  status?: string | null;
+  label?: string | null;
+  score?: number | null;
+  slippageBps?: number | null;
+  liquidityBucket?: string | null;
+  gapRisk?: string | null;
+  notFillable?: boolean;
+  costModel?: string | null;
+  note?: string | null;
 }
 
 export interface PickerCandidateItem {
@@ -98,6 +160,9 @@ export interface PickerCandidateItem {
   volumeRatio?: number | null;
   distanceToHighPct?: number | null;
   totalScore?: number | null;
+  environmentFit?: string | null;
+  environmentFitLabel?: string | null;
+  signalBucket?: string | null;
   boardNames: string[];
   newsBriefs: PickerNewsBrief[];
   explanationSummary?: string | null;
@@ -105,6 +170,13 @@ export interface PickerCandidateItem {
   explanationRisks: string[];
   explanationWatchpoints: string[];
   technicalSnapshot: Record<string, unknown>;
+  executionConstraints?: PickerExecutionConstraints;
+  researchConfidence?: PickerResearchConfidence;
+  executionConfidence?: PickerExecutionConfidence;
+  tradePlan?: Record<string, unknown>;
+  advancedFactors?: Record<string, unknown>;
+  aiReview?: Record<string, unknown>;
+  templateFailureFlags?: Array<Record<string, unknown>>;
   scoreBreakdown: PickerScoreItem[];
   evaluations: PickerCandidateEvaluationItem[];
 }
@@ -178,4 +250,127 @@ export interface PickerTemplateStatsResponse {
   windowDays: number;
   benchmarkCode: string;
   items: PickerTemplateStatItem[];
+}
+
+export interface PickerStratifiedStatItem {
+  bucketKey: string;
+  bucketLabel: string;
+  totalEvaluations: number;
+  comparableEvaluations?: number;
+  benchmarkUnavailableEvaluations?: number;
+  winRatePct?: number | null;
+  avgReturnPct?: number | null;
+  avgExcessReturnPct?: number | null;
+  avgMaxDrawdownPct?: number | null;
+}
+
+export interface PickerStratifiedStatsResponse {
+  windowDays: number;
+  benchmarkCode: string;
+  byMarketRegime: PickerStratifiedStatItem[];
+  byTemplate: PickerStratifiedStatItem[];
+  byRankBucket: PickerStratifiedStatItem[];
+  bySignalBucket: PickerStratifiedStatItem[];
+}
+
+export interface PickerCalibrationStatItem {
+  templateId: string;
+  templateName: string;
+  marketRegime: string;
+  marketRegimeLabel: string;
+  ruleVersion: string;
+  bucketKey: string;
+  bucketLabel: string;
+  windowDays: number;
+  samples: number;
+  nominalProbabilityPct?: number | null;
+  actualWinRatePct?: number | null;
+  calibrationGapPct?: number | null;
+  avgReturnPct?: number | null;
+  avgExcessReturnPct?: number | null;
+  avgMaxDrawdownPct?: number | null;
+  calibrationStatus: string;
+  calibrationLabel: string;
+  highConfidenceGate?: Record<string, unknown>;
+}
+
+export interface PickerCalibrationStatsResponse {
+  windowDays: number;
+  benchmarkCode: string;
+  items: PickerCalibrationStatItem[];
+}
+
+export interface PickerValidationHoldoutStatItem {
+  templateId: string;
+  templateName: string;
+  ruleVersion: string;
+  windowDays: number;
+  sampleStatus: string;
+  comparableSamples: number;
+  inSampleCount: number;
+  outOfSampleCount: number;
+  splitRatio: number;
+  analysisDateStart?: string | null;
+  analysisDateEnd?: string | null;
+  outOfSampleWinRatePct?: number | null;
+  outOfSampleAvgReturnPct?: number | null;
+  outOfSampleAvgExcessReturnPct?: number | null;
+  outOfSampleAvgMaxDrawdownPct?: number | null;
+}
+
+export interface PickerValidationRollingStatItem {
+  templateId: string;
+  templateName: string;
+  ruleVersion: string;
+  windowDays: number;
+  rollingMonth: string;
+  sampleStatus: string;
+  rollingCount: number;
+  rollingWinRatePct?: number | null;
+  rollingAvgExcessReturnPct?: number | null;
+  rollingAvgMaxDrawdownPct?: number | null;
+}
+
+export interface PickerValidationStatsResponse {
+  windowDays: number;
+  benchmarkCode: string;
+  outOfSampleByTemplate: PickerValidationHoldoutStatItem[];
+  rollingMonthlyByTemplate: PickerValidationRollingStatItem[];
+}
+
+export interface PickerRiskStatItem {
+  templateId: string;
+  templateName: string;
+  ruleVersion: string;
+  windowDays: number;
+  sampleStatus: string;
+  sampleCount: number;
+  avgReturnPct?: number | null;
+  avgExcessReturnPct?: number | null;
+  avgMaxDrawdownPct?: number | null;
+  avgMfePct?: number | null;
+  avgMaePct?: number | null;
+  profitFactor?: number | null;
+  returnDrawdownRatio?: number | null;
+  returnPctP25?: number | null;
+  returnPctP50?: number | null;
+  returnPctP75?: number | null;
+  excessReturnPctP25?: number | null;
+  excessReturnPctP50?: number | null;
+  excessReturnPctP75?: number | null;
+  maxDrawdownPctP25?: number | null;
+  maxDrawdownPctP50?: number | null;
+  maxDrawdownPctP75?: number | null;
+  mfePctP25?: number | null;
+  mfePctP50?: number | null;
+  mfePctP75?: number | null;
+  maePctP25?: number | null;
+  maePctP50?: number | null;
+  maePctP75?: number | null;
+}
+
+export interface PickerRiskStatsResponse {
+  windowDays: number;
+  benchmarkCode: string;
+  items: PickerRiskStatItem[];
 }

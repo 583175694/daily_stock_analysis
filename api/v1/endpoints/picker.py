@@ -10,10 +10,16 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from api.deps import get_stock_picker_service
 from api.v1.schemas.common import ErrorResponse
 from api.v1.schemas.picker import (
+    PickerCalibrationStatItem,
+    PickerCalibrationStatsResponse,
+    PickerRiskStatItem,
+    PickerRiskStatsResponse,
     PickerRunRequest,
     PickerRunResponse,
     PickerSectorsResponse,
     PickerSectorItem,
+    PickerStratifiedStatItem,
+    PickerStratifiedStatsResponse,
     PickerTaskDetailResponse,
     PickerTaskItem,
     PickerTemplateStatItem,
@@ -23,6 +29,9 @@ from api.v1.schemas.picker import (
     PickerTemplateItem,
     PickerUniverseItem,
     PickerUniversesResponse,
+    PickerValidationHoldoutStatItem,
+    PickerValidationRollingStatItem,
+    PickerValidationStatsResponse,
 )
 from src.stock_picker.service import StockPickerService
 
@@ -171,4 +180,128 @@ def get_picker_template_stats(
         window_days=payload["window_days"],
         benchmark_code=payload["benchmark_code"],
         items=items,
+    )
+
+
+@router.get(
+    "/stats/stratified",
+    response_model=PickerStratifiedStatsResponse,
+    responses={
+        200: {"description": "分层统计"},
+        400: {"description": "参数错误", "model": ErrorResponse},
+    },
+    summary="获取 AI 选股基础分层统计",
+)
+def get_picker_stratified_stats(
+    window_days: int = Query(10, ge=1, description="统计窗口，仅支持 5/10/20"),
+    service: StockPickerService = Depends(get_stock_picker_service),
+) -> PickerStratifiedStatsResponse:
+    try:
+        payload = service.list_stratified_stats(window_days=window_days)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_params", "message": str(exc)},
+        )
+    return PickerStratifiedStatsResponse(
+        window_days=payload["window_days"],
+        benchmark_code=payload["benchmark_code"],
+        by_market_regime=[
+            PickerStratifiedStatItem(**item) for item in payload["by_market_regime"]
+        ],
+        by_template=[
+            PickerStratifiedStatItem(**item) for item in payload["by_template"]
+        ],
+        by_rank_bucket=[
+            PickerStratifiedStatItem(**item) for item in payload["by_rank_bucket"]
+        ],
+        by_signal_bucket=[
+            PickerStratifiedStatItem(**item) for item in payload["by_signal_bucket"]
+        ],
+    )
+
+
+@router.get(
+    "/stats/calibration",
+    response_model=PickerCalibrationStatsResponse,
+    responses={
+        200: {"description": "置信度校准统计"},
+        400: {"description": "参数错误", "model": ErrorResponse},
+    },
+    summary="获取 AI 选股置信度校准统计",
+)
+def get_picker_calibration_stats(
+    window_days: int = Query(10, ge=1, description="统计窗口，仅支持 5/10/20"),
+    service: StockPickerService = Depends(get_stock_picker_service),
+) -> PickerCalibrationStatsResponse:
+    try:
+        payload = service.list_calibration_stats(window_days=window_days)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_params", "message": str(exc)},
+        )
+    return PickerCalibrationStatsResponse(
+        window_days=payload["window_days"],
+        benchmark_code=payload["benchmark_code"],
+        items=[PickerCalibrationStatItem(**item) for item in payload["items"]],
+    )
+
+
+@router.get(
+    "/stats/validation",
+    response_model=PickerValidationStatsResponse,
+    responses={
+        200: {"description": "样本外与月滚动验证统计"},
+        400: {"description": "参数错误", "model": ErrorResponse},
+    },
+    summary="获取 AI 选股样本外与月滚动验证统计",
+)
+def get_picker_validation_stats(
+    window_days: int = Query(10, ge=1, description="统计窗口，仅支持 5/10/20"),
+    service: StockPickerService = Depends(get_stock_picker_service),
+) -> PickerValidationStatsResponse:
+    try:
+        payload = service.list_validation_stats(window_days=window_days)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_params", "message": str(exc)},
+        )
+    return PickerValidationStatsResponse(
+        window_days=payload["window_days"],
+        benchmark_code=payload["benchmark_code"],
+        out_of_sample_by_template=[
+            PickerValidationHoldoutStatItem(**item) for item in payload["out_of_sample_by_template"]
+        ],
+        rolling_monthly_by_template=[
+            PickerValidationRollingStatItem(**item) for item in payload["rolling_monthly_by_template"]
+        ],
+    )
+
+
+@router.get(
+    "/stats/risk",
+    response_model=PickerRiskStatsResponse,
+    responses={
+        200: {"description": "风险调整与分布指标"},
+        400: {"description": "参数错误", "model": ErrorResponse},
+    },
+    summary="获取 AI 选股风险调整与分布指标",
+)
+def get_picker_risk_stats(
+    window_days: int = Query(10, ge=1, description="统计窗口，仅支持 5/10/20"),
+    service: StockPickerService = Depends(get_stock_picker_service),
+) -> PickerRiskStatsResponse:
+    try:
+        payload = service.list_risk_stats(window_days=window_days)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_params", "message": str(exc)},
+        )
+    return PickerRiskStatsResponse(
+        window_days=payload["window_days"],
+        benchmark_code=payload["benchmark_code"],
+        items=[PickerRiskStatItem(**item) for item in payload["items"]],
     )

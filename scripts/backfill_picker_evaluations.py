@@ -88,6 +88,7 @@ def main() -> int:
         print(f"skipped_completed={item.get('skipped_completed', 0)}")
         print(f"skipped_non_cn={item.get('skipped_non_cn', 0)}")
         print(f"skipped_missing_analysis_date={item.get('skipped_missing_analysis_date', 0)}")
+        print("note=回补结果会同步写入 return/max_drawdown/mfe/mae 等评估字段")
     return 0
 
 

@@ -1,14 +1,18 @@
 import apiClient from './index';
 import { toCamelCase } from './utils';
 import type {
+  PickerCalibrationStatsResponse,
+  PickerRiskStatsResponse,
   PickerRunRequest,
   PickerRunResponse,
   PickerSectorItem,
+  PickerStratifiedStatsResponse,
   PickerTaskDetail,
   PickerTaskItem,
   PickerTemplateItem,
   PickerTemplateStatsResponse,
   PickerUniverseItem,
+  PickerValidationStatsResponse,
 } from '../types/stockPicker';
 
 export const stockPickerApi = {
@@ -63,5 +67,33 @@ export const stockPickerApi = {
       params: { window_days: windowDays },
     });
     return toCamelCase<PickerTemplateStatsResponse>(response.data);
+  },
+
+  async getStratifiedStats(windowDays = 10): Promise<PickerStratifiedStatsResponse> {
+    const response = await apiClient.get<Record<string, unknown>>('/api/v1/picker/stats/stratified', {
+      params: { window_days: windowDays },
+    });
+    return toCamelCase<PickerStratifiedStatsResponse>(response.data);
+  },
+
+  async getCalibrationStats(windowDays = 10): Promise<PickerCalibrationStatsResponse> {
+    const response = await apiClient.get<Record<string, unknown>>('/api/v1/picker/stats/calibration', {
+      params: { window_days: windowDays },
+    });
+    return toCamelCase<PickerCalibrationStatsResponse>(response.data);
+  },
+
+  async getValidationStats(windowDays = 10): Promise<PickerValidationStatsResponse> {
+    const response = await apiClient.get<Record<string, unknown>>('/api/v1/picker/stats/validation', {
+      params: { window_days: windowDays },
+    });
+    return toCamelCase<PickerValidationStatsResponse>(response.data);
+  },
+
+  async getRiskStats(windowDays = 10): Promise<PickerRiskStatsResponse> {
+    const response = await apiClient.get<Record<string, unknown>>('/api/v1/picker/stats/risk', {
+      params: { window_days: windowDays },
+    });
+    return toCamelCase<PickerRiskStatsResponse>(response.data);
   },
 };

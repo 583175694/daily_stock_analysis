@@ -123,10 +123,17 @@ def _print_summary(result: dict) -> None:
         eval_text = ", ".join(
             f"{window}日={eval_map.get(int(window), 'n/a')}" for window in result["window_days"]
         )
+        detail_parts = []
+        for item in candidate.get("evaluations") or []:
+            detail_parts.append(
+                f"{item['window_days']}日(status={item.get('eval_status')}, excess={item.get('excess_return_pct')}, dd={item.get('max_drawdown_pct')}, mfe={item.get('mfe_pct')}, mae={item.get('mae_pct')})"
+            )
         print(
             f"- #{candidate['rank']} {candidate['name']} ({candidate['code']}) "
             f"score={candidate['total_score']} latest={candidate['latest_date']} [{eval_text}]"
         )
+        if detail_parts:
+            print(f"  评估细节: {'; '.join(detail_parts)}")
 
 
 def main() -> int:

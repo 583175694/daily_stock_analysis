@@ -116,6 +116,8 @@ class TestStockPickerRepository(unittest.TestCase):
             benchmark_return_pct=2.5,
             excess_return_pct=3.21,
             max_drawdown_pct=1.8,
+            mfe_pct=6.4,
+            mae_pct=-1.2,
         )
 
         payload = self.repo.get_task("picker-task-1", include_candidates=True)
@@ -129,6 +131,95 @@ class TestStockPickerRepository(unittest.TestCase):
         self.assertEqual(evaluations[0]["benchmark_status"], "completed")
         self.assertTrue(evaluations[0]["is_comparable"])
         self.assertAlmostEqual(evaluations[0]["excess_return_pct"], 3.21, places=2)
+        self.assertAlmostEqual(evaluations[0]["mfe_pct"], 6.4, places=2)
+        self.assertAlmostEqual(evaluations[0]["mae_pct"], -1.2, places=2)
+
+    def test_task_detail_exposes_execution_and_confidence_fields_from_snapshot(self) -> None:
+        self.repo.create_task(
+            task_id="picker-task-confidence",
+            template_id="trend_breakout",
+            template_version="v4_1_phase2",
+            universe_id="watchlist",
+            limit=20,
+            ai_top_k=5,
+            force_refresh=False,
+            request_payload={"mode": "watchlist"},
+        )
+        self.repo.save_candidates(
+            "picker-task-confidence",
+            summary={"selected_count": 1},
+            candidates=[
+                {
+                    "rank": 1,
+                    "code": "600519",
+                    "name": "贵州茅台",
+                    "market": "cn",
+                    "selection_reason": "strict_match",
+                    "latest_date": date(2026, 4, 11),
+                    "latest_close": 10.8,
+                    "change_pct": 5.88,
+                    "volume_ratio": 1.35,
+                    "distance_to_high_pct": -0.8,
+                    "total_score": 92.4,
+                    "board_names": ["白酒"],
+                    "news_briefs": [],
+                    "explanation_summary": "测试摘要",
+                    "explanation_rationale": ["理由1"],
+                    "explanation_risks": ["风险1"],
+                    "explanation_watchpoints": ["观察点1"],
+                    "technical_snapshot": {
+                        "execution_constraints": {
+                            "status": "cautious",
+                            "status_label": "执行谨慎",
+                            "slippage_bps": 15,
+                        },
+                        "research_confidence": {
+                            "status": "calibration_pending",
+                            "label": "观察中（待校准）",
+                            "comparable_samples": 12,
+                        },
+                        "execution_confidence": {
+                            "status": "cautious",
+                            "label": "执行谨慎",
+                            "score": 0.45,
+                        },
+                        "trade_plan": {
+                            "action": "buy",
+                        },
+                        "advanced_factors": {
+                            "factor_total": 8.5,
+                            "relative_strength": {"score": 3.0},
+                        },
+                        "ai_review": {
+                            "veto_level": "soft_veto",
+                            "review_summary": "执行质量不足，先观察。",
+                        },
+                        "template_failure_flags": [
+                            {
+                                "flag": "execution_untradable",
+                                "label": "执行约束恶化",
+                                "severity": "high",
+                                "source": "rule_engine",
+                            }
+                        ],
+                    },
+                    "score_breakdown": [],
+                }
+            ],
+        )
+
+        payload = self.repo.get_task("picker-task-confidence", include_candidates=True)
+
+        candidate = payload["candidates"][0]
+        self.assertEqual(candidate["execution_constraints"]["status"], "cautious")
+        self.assertEqual(candidate["execution_constraints"]["status_label"], "执行谨慎")
+        self.assertEqual(candidate["research_confidence"]["status"], "calibration_pending")
+        self.assertEqual(candidate["research_confidence"]["comparable_samples"], 12)
+        self.assertEqual(candidate["execution_confidence"]["score"], 0.45)
+        self.assertEqual(candidate["trade_plan"]["action"], "buy")
+        self.assertEqual(candidate["advanced_factors"]["factor_total"], 8.5)
+        self.assertEqual(candidate["ai_review"]["veto_level"], "soft_veto")
+        self.assertEqual(candidate["template_failure_flags"][0]["source"], "rule_engine")
 
     def test_list_task_ids_can_filter_completed_tasks(self) -> None:
         self.repo.create_task(
@@ -248,6 +339,8 @@ class TestStockPickerRepository(unittest.TestCase):
             benchmark_return_pct=None,
             excess_return_pct=None,
             max_drawdown_pct=1.8,
+            mfe_pct=4.2,
+            mae_pct=-2.5,
         )
 
         payload = self.repo.get_task("picker-task-benchmark-gap", include_candidates=True)
@@ -257,6 +350,74 @@ class TestStockPickerRepository(unittest.TestCase):
         self.assertEqual(evaluation["benchmark_status"], "unavailable")
         self.assertFalse(evaluation["is_comparable"])
         self.assertAlmostEqual(evaluation["return_pct"], 5.71, places=2)
+        self.assertAlmostEqual(evaluation["mfe_pct"], 4.2, places=2)
+        self.assertAlmostEqual(evaluation["mae_pct"], -2.5, places=2)
+
+    def test_list_evaluation_rows_for_window_includes_analysis_date_and_excursion_metrics(self) -> None:
+        self.repo.create_task(
+            task_id="picker-task-stats",
+            template_id="balanced",
+            template_version="v4_2_phase2",
+            universe_id="watchlist",
+            limit=20,
+            ai_top_k=5,
+            force_refresh=False,
+            request_payload={"mode": "watchlist"},
+        )
+        self.repo.save_candidates(
+            "picker-task-stats",
+            summary={"market_regime_snapshot": {"regime": "trend_up"}},
+            candidates=[
+                {
+                    "rank": 1,
+                    "code": "600519",
+                    "name": "贵州茅台",
+                    "market": "cn",
+                    "selection_reason": "strict_match",
+                    "latest_date": date(2026, 4, 11),
+                    "latest_close": 10.8,
+                    "change_pct": 5.88,
+                    "volume_ratio": 1.35,
+                    "distance_to_high_pct": -0.8,
+                    "total_score": 92.4,
+                    "board_names": ["白酒"],
+                    "news_briefs": [],
+                    "explanation_summary": "测试摘要",
+                    "explanation_rationale": ["理由1"],
+                    "explanation_risks": ["风险1"],
+                    "explanation_watchpoints": ["观察点1"],
+                    "technical_snapshot": {"signal_bucket": "high"},
+                    "score_breakdown": [],
+                }
+            ],
+        )
+        candidate_rows = self.repo.get_task_candidate_rows("picker-task-stats")
+        self.repo.upsert_candidate_evaluation(
+            picker_candidate_id=candidate_rows[0]["candidate_id"],
+            window_days=10,
+            benchmark_code="000300",
+            eval_status="completed",
+            entry_date=date(2026, 4, 14),
+            entry_price=10.5,
+            exit_date=date(2026, 4, 24),
+            exit_price=11.1,
+            benchmark_entry_price=4.0,
+            benchmark_exit_price=4.1,
+            return_pct=5.71,
+            benchmark_return_pct=2.5,
+            excess_return_pct=3.21,
+            max_drawdown_pct=1.8,
+            mfe_pct=6.2,
+            mae_pct=-1.4,
+        )
+
+        rows = self.repo.list_evaluation_rows_for_window(10)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["analysis_date"], "2026-04-11")
+        self.assertEqual(rows[0]["rule_version"], "v4_2_phase2")
+        self.assertAlmostEqual(rows[0]["mfe_pct"], 6.2, places=2)
+        self.assertAlmostEqual(rows[0]["mae_pct"], -1.4, places=2)
 
 
 if __name__ == "__main__":

@@ -500,6 +500,8 @@ class PickerCandidateEvaluation(Base):
     benchmark_return_pct = Column(Float)
     excess_return_pct = Column(Float)
     max_drawdown_pct = Column(Float)
+    mfe_pct = Column(Float)
+    mae_pct = Column(Float)
     created_at = Column(DateTime, default=datetime.now, index=True)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
 
@@ -804,6 +806,7 @@ class DatabaseManager:
         
         # 创建所有表
         Base.metadata.create_all(self._engine)
+        self._ensure_schema_compatibility()
 
         self._initialized = True
         logger.info(f"数据库初始化完成: {db_url}")
@@ -864,6 +867,34 @@ class DatabaseManager:
     def _is_file_sqlite_database(self) -> bool:
         database = (self._engine.url.database or "").strip()
         return bool(database) and database.lower() != ":memory:"
+
+    def _ensure_schema_compatibility(self) -> None:
+        """Apply minimal additive schema updates for existing SQLite databases."""
+        if not self._is_sqlite_engine:
+            return
+        self._ensure_picker_candidate_evaluation_columns()
+
+    def _ensure_picker_candidate_evaluation_columns(self) -> None:
+        required_columns = {
+            "mfe_pct": "ALTER TABLE picker_candidate_evaluations ADD COLUMN mfe_pct FLOAT",
+            "mae_pct": "ALTER TABLE picker_candidate_evaluations ADD COLUMN mae_pct FLOAT",
+        }
+        with self._engine.begin() as connection:
+            try:
+                result = connection.exec_driver_sql("PRAGMA table_info('picker_candidate_evaluations')")
+            except Exception as exc:
+                logger.warning("读取 picker_candidate_evaluations 表结构失败: %s", exc)
+                return
+            existing_columns = {
+                str(row[1])
+                for row in result.fetchall()
+                if len(row) > 1 and row[1]
+            }
+            for column_name, sql in required_columns.items():
+                if column_name in existing_columns:
+                    continue
+                connection.exec_driver_sql(sql)
+                logger.info("已为 picker_candidate_evaluations 自动补充列: %s", column_name)
 
     def _run_write_transaction(
         self,
